@@ -24,17 +24,18 @@ Native GTK4 + libadwaita Linux desktop client for [Ring](https://ring.com) home 
 
 ### System packages
 
-| Package | Notes |
-|---|---|
-| `python-gobject` / `python3-gi` | PyGObject — GTK Python bindings |
-| `gir1.2-gtk-4.0` | GTK 4 introspection data |
-| `gir1.2-adw-1` | libadwaita introspection data |
-| `gir1.2-notify-0.7` | libnotify (desktop notifications) |
-| `gir1.2-ayatanaappindicator3-0.1` | Systray icon (optional) |
+PyGObject and the GTK/GNOME introspection libraries must be installed from
+pacman — they cannot be installed via pip.
 
-**Arch:** `python-gobject gtk4 libadwaita libnotify libayatana-appindicator`
-**Debian/Ubuntu:** `python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-notify-0.7 gir1.2-ayatanaappindicator3-0.1`
-**Fedora:** `python3-gobject gtk4 libadwaita libnotify libayatana-appindicator`
+```bash
+sudo pacman -S python-gobject gtk4 libadwaita libnotify
+```
+
+The systray icon requires `libayatana-appindicator`, which is in the AUR:
+
+```bash
+yay -S libayatana-appindicator
+```
 
 ### Python dependencies (managed by uv)
 
@@ -47,17 +48,21 @@ Native GTK4 + libadwaita Linux desktop client for [Ring](https://ring.com) home 
 git clone https://github.com/JamesFromFL/ring-gtk
 cd ring-gtk
 
-# Install Python deps via uv
-uv sync
+# Expose system-installed PyGObject to the uv virtualenv
+uv sync --system-site-packages
 
 # Run
 uv run ring-gtk
 ```
 
+> `--system-site-packages` is required so the virtualenv can find
+> `gi` (PyGObject) and the GObject introspection libraries installed
+> via pacman. Without it, `import gi` will fail at runtime.
+
 ## Development
 
 ```bash
-uv sync --dev
+uv sync --system-site-packages --dev
 uv run ruff check src tests
 uv run pytest
 ```
