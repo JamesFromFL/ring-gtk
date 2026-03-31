@@ -16,6 +16,37 @@ from ring_gtk.ring_client import get_client  # noqa: E402
 
 _log = logging.getLogger(__name__)
 
+
+def _apply_motion_off_overlay(png_bytes: bytes) -> bytes:
+    """Return a blurred copy of *png_bytes* with a 'Motion Detection Off' label.
+
+    Called in a background thread — Pillow I/O is safe here.
+    Falls back to the original bytes if Pillow is unavailable.
+    """
+    try:
+        import io
+
+        from PIL import Image, ImageDraw, ImageFilter
+
+        img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+        img = img.filter(ImageFilter.GaussianBlur(radius=4))
+        draw = ImageDraw.Draw(img)
+        text = "Motion Detection Off"
+        w, h = img.size
+        bbox = draw.textbbox((0, 0), text)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        x, y = (w - tw) // 2, (h - th) // 2
+        # Shadow for legibility on any background.
+        draw.text((x + 1, y + 1), text, fill=(0, 0, 0))
+        draw.text((x, y), text, fill=(255, 255, 255))
+        out = io.BytesIO()
+        img.save(out, format="PNG")
+        return out.getvalue()
+    except Exception as exc:
+        _log.debug("motion overlay failed: %s", exc)
+        return png_bytes
+
+
 # Map ring-doorbell device family names to symbolic icon names.
 _FAMILY_ICON: dict[str, str] = {
     "doorbots": "video-display-symbolic",
@@ -44,6 +75,8 @@ class RingWindow(Adw.ApplicationWindow):
         )
         # device_id → (device_obj, Gtk.Picture | None)
         self._device_rows: dict[int, tuple] = {}
+        # device_id → GLib source_id for 30-second fallback snapshot refresh.
+        self._refresh_timers: dict[int, int] = {}
         self._build_ui()
         self.refresh()
 
@@ -160,6 +193,7 @@ class RingWindow(Adw.ApplicationWindow):
                     args=(device,),
                     daemon=True,
                 ).start()
+                self._start_refresh_timer(device.id)
             else:
                 row.set_icon_name(icon)
                 self._device_rows[device.id] = (device, None)
@@ -199,7 +233,10 @@ class RingWindow(Adw.ApplicationWindow):
         try:
             png_bytes = client._run(device.async_get_snapshot())
             if png_bytes:
-                GLib.idle_add(self._set_snapshot, device.id, bytes(png_bytes))
+                img = bytes(png_bytes)
+                if not getattr(device, "motion_detection", True):
+                    img = _apply_motion_off_overlay(img)
+                GLib.idle_add(self._set_snapshot, device.id, img)
             else:
                 _log.debug("No snapshot returned for %s", device.name)
         except Exception as exc:
@@ -248,6 +285,8 @@ class RingWindow(Adw.ApplicationWindow):
             args=(device,),
             daemon=True,
         ).start()
+        # Reset the 30-second fallback timer so it counts from this event.
+        self._start_refresh_timer(device_id)
 
     # ------------------------------------------------------------------
     # Row click → live stream dialog
@@ -275,9 +314,42 @@ class RingWindow(Adw.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def _clear_list(self) -> None:
+        self._cancel_all_refresh_timers()
         self._device_rows.clear()
         while (child := self._list_box.get_first_child()) is not None:
             self._list_box.remove(child)
+
+    # ------------------------------------------------------------------
+    # Fallback snapshot refresh timers (30s per camera)
+    # ------------------------------------------------------------------
+
+    def _start_refresh_timer(self, device_id: int) -> None:
+        """(Re)start the 30-second fallback timer for *device_id*."""
+        self._cancel_refresh_timer(device_id)
+        source_id = GLib.timeout_add_seconds(30, self._fallback_refresh, device_id)
+        self._refresh_timers[device_id] = source_id
+
+    def _cancel_refresh_timer(self, device_id: int) -> None:
+        source_id = self._refresh_timers.pop(device_id, None)
+        if source_id is not None:
+            GLib.source_remove(source_id)
+
+    def _cancel_all_refresh_timers(self) -> None:
+        for source_id in self._refresh_timers.values():
+            GLib.source_remove(source_id)
+        self._refresh_timers.clear()
+
+    def _fallback_refresh(self, device_id: int) -> bool:
+        """Timer callback: fetch a fresh snapshot if the device is still in the list."""
+        entry = self._device_rows.get(device_id)
+        if entry is None or entry[1] is None:
+            self._refresh_timers.pop(device_id, None)
+            return GLib.SOURCE_REMOVE
+        device, _ = entry
+        _log.debug("Fallback snapshot refresh for %s (no FCM event in 30 s)", device.name)
+        threading.Thread(target=self._load_snapshot, args=(device,), daemon=True).start()
+        self._refresh_timers.pop(device_id, None)
+        return GLib.SOURCE_REMOVE
 
     # ------------------------------------------------------------------
     # Auth

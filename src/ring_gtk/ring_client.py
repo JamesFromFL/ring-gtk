@@ -282,6 +282,23 @@ class RingClient:
             await listener.stop()
             _log.info("FCM event listener stopped")
 
+    async def async_get_turn_servers(self) -> list[dict]:
+        """Fetch TURN server credentials from Ring's API.
+
+        Returns a list of dicts with keys ``url``, ``username``, ``credential``
+        (matching the shape aiortc's RTCIceServer expects).  Returns an empty
+        list on any error so callers can fall back to STUN-only gracefully.
+        """
+        if self._ring is None:
+            return []
+        try:
+            resp = await self._ring.async_query("/clients_api/turn_servers")
+            data = resp.json()
+            return data.get("servers", [])
+        except Exception as exc:
+            _log.debug("TURN server fetch skipped: %s", exc)
+            return []
+
     def add_event_callback(self, callback) -> None:
         """Register a callable to be invoked (on the GTK main thread) for every FCM event."""
         if callback not in self._event_callbacks:

@@ -44,6 +44,40 @@ from gi.repository import Adw, GLib, Gst, Gtk  # noqa: E402
 
 _log = logging.getLogger(__name__)
 
+
+def _patch_aiortc_h264() -> None:
+    """Monkey-patch aiortc's H264Decoder to relax error detection.
+
+    Ring cameras (particularly newer stickup_cam_mini variants) often send
+    H264 bitstreams that use Main or High profile features (e.g. B-frames)
+    even though aiortc negotiates Baseline profile in the SDP offer.  FFmpeg
+    rejects these packets with "Invalid data found when processing input"
+    because they violate the negotiated profile constraints.
+
+    Setting err_detect=0 tells FFmpeg not to treat profile violations as
+    fatal errors, allowing it to decode the frames best-effort.  The patch
+    is applied once when this module is imported, before any RTCPeerConnection
+    is created.
+    """
+    try:
+        from aiortc.codecs.h264 import H264Decoder
+
+        _orig_init = H264Decoder.__init__
+
+        def _permissive_init(self) -> None:
+            _orig_init(self)
+            # Disable bitstream error detection so non-baseline streams
+            # (B-frames, high profile) are decoded rather than dropped.
+            self.codec.options = {"err_detect": "0"}
+
+        H264Decoder.__init__ = _permissive_init
+        _log.debug("Applied permissive H264 decoder patch")
+    except Exception as exc:
+        _log.debug("Could not patch H264Decoder: %s", exc)
+
+
+_patch_aiortc_h264()
+
 # Map av AudioFrame format names to GStreamer format strings.
 _AV_TO_GST_FMT: dict[str, str] = {
     "s16": "S16LE",
@@ -179,9 +213,25 @@ class LiveStreamDialog(Adw.Dialog):
         session_id = str(uuid.uuid4())
         self._session_id = session_id
 
-        pc = RTCPeerConnection(
-            RTCConfiguration(iceServers=[RTCIceServer(urls=self._device.get_ice_servers())])
-        )
+        # Build ICE server list: always include Ring's STUN servers; merge in
+        # any TURN credentials returned by the Ring API so that cameras behind
+        # strict NAT (where STUN peer-to-peer fails) can still stream via relay.
+        ice_servers = [RTCIceServer(urls=self._device.get_ice_servers())]
+        turn_servers = await client.async_get_turn_servers()
+        for srv in turn_servers:
+            url = srv.get("url") or srv.get("urls")
+            if url:
+                ice_servers.append(
+                    RTCIceServer(
+                        urls=[url] if isinstance(url, str) else url,
+                        username=srv.get("username"),
+                        credential=srv.get("credential"),
+                    )
+                )
+        if turn_servers:
+            _log.debug("Added %d TURN server(s) to ICE configuration", len(turn_servers))
+
+        pc = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
         self._pc = pc
 
         pc.addTransceiver("video", direction="recvonly")
