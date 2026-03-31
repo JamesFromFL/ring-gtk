@@ -213,6 +213,12 @@ class LiveStreamDialog(Adw.Dialog):
         self._vol_element = self._pipeline.get_by_name("vol")
         paintable = self._pipeline.get_by_name("vsink").get_property("paintable")
 
+        # Pre-declare the pixel format on the video appsrc so downstream
+        # elements can negotiate format before the first frame arrives.
+        # Width and height are intentionally omitted here — they are set on the
+        # first decoded frame (where the actual camera resolution is known).
+        self._video_appsrc.set_property("caps", Gst.Caps.from_string("video/x-raw,format=RGB"))
+
         toolbar_view = Adw.ToolbarView()
         self.set_child(toolbar_view)
 
@@ -368,28 +374,39 @@ class LiveStreamDialog(Adw.Dialog):
     # ------------------------------------------------------------------
 
     async def _receive_frames(self, track) -> None:
+        import numpy as np
         from aiortc.mediastreams import MediaStreamError
 
         _log.debug("Video frame receiver started")
         while True:
             try:
                 frame = await track.recv()  # av.VideoFrame (decoded H.264)
-                # Use RGBA (4 bytes/pixel) rather than RGB (3 bytes/pixel).
-                # GStreamer computes stride for RGB as GST_ROUND_UP_4(width*3),
-                # so widths like 1274 produce a 2-byte gap per row that causes
-                # every buffer to be silently discarded.  RGBA stride = width*4
-                # is always 4-byte-aligned for any width.
-                rgba = frame.to_ndarray(format="rgba")
-                h, w = rgba.shape[:2]
-                raw: bytes = rgba.tobytes()
+                rgb = frame.to_ndarray(format="rgb24")
+                h, w = rgb.shape[:2]
+
+                # GStreamer requires each row's stride to be a multiple of 4 bytes.
+                # For RGB (3 bytes/pixel), stride = width×3 must be divisible by 4.
+                # Widths like 1274 (stride 3822, not divisible by 4) or 720 (stride
+                # 2160, not divisible by 4) cause buffer-size mismatches and heap
+                # corruption.  Pad width up to the nearest multiple of 4.
+                w_caps = (w + 3) & ~3
+                if w_caps != w:
+                    padded = np.zeros((h, w_caps, 3), dtype=np.uint8)
+                    padded[:, :w, :] = rgb
+                    raw: bytes = padded.tobytes()
+                else:
+                    raw = rgb.tobytes()
 
                 if not self._video_caps_set:
                     caps = Gst.Caps.from_string(
-                        f"video/x-raw,format=RGBA,width={w},height={h},framerate=0/1"
+                        f"video/x-raw,format=RGB,width={w_caps},height={h},framerate=0/1"
                     )
                     self._video_appsrc.set_property("caps", caps)
                     self._video_caps_set = True
-                    _log.debug("Video stream: %dx%d", w, h)
+                    if w_caps != w:
+                        _log.debug("Video stream: %dx%d (padded to %dx%d)", w, h, w_caps, h)
+                    else:
+                        _log.debug("Video stream: %dx%d", w, h)
 
                 self._video_appsrc.emit("push-buffer", Gst.Buffer.new_wrapped(raw))
 
