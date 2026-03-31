@@ -1,7 +1,7 @@
 """Main application window — Nautilus-style Adw.OverlaySplitView layout.
 
-Left sidebar: app icon + navigation list (Cameras / Event History).
-Right content: Gtk.Stack switching between CamerasPage and HistoryPage.
+Left sidebar: navigation list (Home / Cameras / Event History).
+Right content: Gtk.Stack switching between HomePage, CamerasPage, HistoryPage.
 """
 
 from __future__ import annotations
@@ -17,12 +17,14 @@ from gi.repository import Adw, Gtk  # noqa: E402
 
 from ring_gtk.cameras_page import CamerasPage  # noqa: E402
 from ring_gtk.history_page import HistoryPage  # noqa: E402
+from ring_gtk.home_page import HomePage  # noqa: E402
 from ring_gtk.ring_client import get_client  # noqa: E402
 
 _log = logging.getLogger(__name__)
 
 # Navigation entries: (page_name, label, icon_name)
 _NAV_ITEMS = [
+    ("home", "Home", "go-home-symbolic"),
     ("cameras", "Cameras", "camera-photo-symbolic"),
     ("history", "Event History", "document-open-recent-symbolic"),
 ]
@@ -46,9 +48,9 @@ class RingWindow(Adw.ApplicationWindow):
     def _build_ui(self) -> None:
         # Root: OverlaySplitView — collapsible sidebar + content area.
         self._split_view = Adw.OverlaySplitView(
-            sidebar_width_fraction=0.22,
-            min_sidebar_width=200,
-            max_sidebar_width=260,
+            sidebar_width_fraction=0.20,
+            min_sidebar_width=180,
+            max_sidebar_width=240,
             collapsed=False,
         )
 
@@ -84,7 +86,7 @@ class RingWindow(Adw.ApplicationWindow):
         outer_toolbar.set_content(self._split_view)
 
         # ------------------------------------------------------------------
-        # Sidebar
+        # Sidebar — navigation list only (no branding icon)
         # ------------------------------------------------------------------
 
         sidebar_box = Gtk.Box(
@@ -92,34 +94,12 @@ class RingWindow(Adw.ApplicationWindow):
             spacing=0,
         )
 
-        # App icon centered at the top.
-        from ring_gtk import APP_ID
-
-        app_icon = Gtk.Image(
-            icon_name=APP_ID,
-            pixel_size=64,
-            margin_top=24,
-            margin_bottom=16,
-            halign=Gtk.Align.CENTER,
-        )
-        sidebar_box.append(app_icon)
-
-        app_label = Gtk.Label(
-            label="Ring",
-            css_classes=["title-2"],
-            halign=Gtk.Align.CENTER,
-            margin_bottom=20,
-        )
-        sidebar_box.append(app_label)
-
-        sidebar_box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
-
-        # Navigation list.
         self._nav_list = Gtk.ListBox(
             css_classes=["navigation-sidebar"],
             selection_mode=Gtk.SelectionMode.SINGLE,
             margin_top=8,
             margin_bottom=8,
+            vexpand=True,
         )
         self._nav_list.connect("row-selected", self._on_nav_selected)
         sidebar_box.append(self._nav_list)
@@ -130,7 +110,6 @@ class RingWindow(Adw.ApplicationWindow):
             self._nav_list.append(row)
             self._nav_rows[name] = row
 
-        sidebar_box.set_vexpand(True)
         self._split_view.set_sidebar(sidebar_box)
 
         # ------------------------------------------------------------------
@@ -144,6 +123,9 @@ class RingWindow(Adw.ApplicationWindow):
         )
         self._split_view.set_content(self._content_stack)
 
+        self._home_page = HomePage()
+        self._content_stack.add_named(self._home_page, "home")
+
         self._cameras_page = CamerasPage(
             on_navigate_to_history=self._navigate_to_history,
         )
@@ -152,8 +134,8 @@ class RingWindow(Adw.ApplicationWindow):
         self._history_page = HistoryPage()
         self._content_stack.add_named(self._history_page, "history")
 
-        # Select "Cameras" by default.
-        self._nav_list.select_row(self._nav_rows["cameras"])
+        # Default to Home.
+        self._nav_list.select_row(self._nav_rows["home"])
 
     def _make_nav_row(self, label: str, icon: str) -> Gtk.ListBoxRow:
         row = Gtk.ListBoxRow()

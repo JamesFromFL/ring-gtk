@@ -11,7 +11,6 @@ import gi
 
 gi.require_version("Adw", "1")
 gi.require_version("Gst", "1.0")
-gi.require_version("GstBase", "1.0")
 gi.require_version("Gtk", "4.0")
 
 from gi.repository import Adw, GLib, Gst, Gtk  # noqa: E402
@@ -59,10 +58,13 @@ class _VideoPlayer(Gtk.Box):
 
     def __init__(self) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, hexpand=True, vexpand=True)
-        self._pipeline: Gst.Element | None = None
         self._duration_ns: int = -1
         self._poll_id: int | None = None
         self._seeking = False
+        # Initialise to None so _build_ui() can safely check even if
+        # _build_pipeline() returns early due to a missing GStreamer element.
+        self._player: Gst.Element | None = None
+        self._paintable = None
         self._build_pipeline()
         self._build_ui()
 
@@ -72,23 +74,19 @@ class _VideoPlayer(Gtk.Box):
             _log.warning("playbin not available")
             return
 
-        # Wrap gtk4paintablesink in a bin with videorate + capsfilter so that
-        # recordings with framerate=0/0 in container metadata don't trigger the
-        # GStreamer-CRITICAL assertion 'a_d != 0' in gst_value_set_fraction().
-        video_bin = Gst.parse_bin_from_description(
-            "videorate ! video/x-raw,framerate=30/1 ! gtk4paintablesink name=vsink sync=false",
-            True,  # ghost_unlinked_pads — exposes the sink pad on the bin
-        )
-        if video_bin is None:
-            _log.warning("Failed to create video bin — gtk4paintablesink may be missing")
+        # Connect gtk4paintablesink directly as the video sink.  Avoid wrapping
+        # it in a videorate bin — the hard 30 fps cap caused playbin to stall on
+        # recordings whose timestamps don't align with the pipeline clock,
+        # resulting in the first frame being displayed but never advanced.
+        # playbin's own internal queue and decodebin handle frame pacing.
+        video_sink = Gst.ElementFactory.make("gtk4paintablesink", "vsink")
+        if video_sink is None:
+            _log.warning("gtk4paintablesink not available")
             return
 
-        self._video_sink = video_bin.get_by_name("vsink")
-        if self._video_sink is None:
-            _log.warning("gtk4paintablesink not found inside video bin")
-            return
-        self._paintable = self._video_sink.get_property("paintable")
-        self._player.set_property("video-sink", video_bin)
+        video_sink.set_property("sync", True)
+        self._paintable = video_sink.get_property("paintable")
+        self._player.set_property("video-sink", video_sink)
 
         bus = self._player.get_bus()
         bus.add_signal_watch()
@@ -133,14 +131,23 @@ class _VideoPlayer(Gtk.Box):
         self._scrubber.connect("change-value", self._on_scrubber_changed)
         self.append(self._scrubber)
 
-        # Playback controls.
+        # Playback controls + volume on the same row.
+        controls_row = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            margin_bottom=8,
+            margin_start=8,
+            margin_end=8,
+        )
+        self.append(controls_row)
+
+        # Centred playback buttons.
         ctrl_box = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL,
             spacing=4,
             halign=Gtk.Align.CENTER,
-            margin_bottom=8,
+            hexpand=True,
         )
-        self.append(ctrl_box)
+        controls_row.append(ctrl_box)
 
         def _btn(icon, tip, cb):
             b = Gtk.Button(icon_name=icon, tooltip_text=tip, css_classes=["flat"])
@@ -153,6 +160,21 @@ class _VideoPlayer(Gtk.Box):
         self._play_btn = _btn("media-playback-start-symbolic", "Play / Pause", self._on_play_pause)
         _btn("media-seek-forward-symbolic", "Seek forward 10 s", self._on_seek_fwd)
         _btn("media-skip-forward-symbolic", "Skip to end", self._on_skip_end)
+
+        # Volume control, right-aligned.
+        vol_box = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=4,
+            valign=Gtk.Align.CENTER,
+        )
+        vol_box.append(Gtk.Image(icon_name="audio-volume-high-symbolic"))
+        self._vol_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 1.0, 0.05)
+        self._vol_scale.set_value(1.0)
+        self._vol_scale.set_draw_value(False)
+        self._vol_scale.set_size_request(100, -1)
+        self._vol_scale.connect("value-changed", self._on_volume_changed)
+        vol_box.append(self._vol_scale)
+        controls_row.append(vol_box)
 
     # ------------------------------------------------------------------
     # Public API
@@ -172,6 +194,7 @@ class _VideoPlayer(Gtk.Box):
         self._player.set_state(Gst.State.PLAYING)
         self._play_btn.set_icon_name("media-playback-pause-symbolic")
         self._placeholder.set_visible(False)
+        # Poll position every 500 ms to drive the scrubber during playback.
         self._start_poll()
 
     def stop(self) -> None:
@@ -198,6 +221,15 @@ class _VideoPlayer(Gtk.Box):
         except Exception as exc:
             _log.debug("Frame capture failed: %s", exc)
             return None
+
+    # ------------------------------------------------------------------
+    # Volume
+    # ------------------------------------------------------------------
+
+    def _on_volume_changed(self, scale: Gtk.Scale) -> None:
+        if self._player is not None:
+            # playbin exposes a native `volume` property (0.0 = muted, 1.0 = 100%).
+            self._player.set_property("volume", scale.get_value())
 
     # ------------------------------------------------------------------
     # Playback controls
@@ -245,7 +277,7 @@ class _VideoPlayer(Gtk.Box):
     def _on_scrubber_changed(self, scale, scroll, value) -> bool:
         return False
 
-    def _on_scrubber_released(self, *_) -> None:
+    def _on_scrubber_released(self) -> None:
         self._seeking = False
         if self._duration_ns > 0:
             frac = self._scrubber.get_value()
@@ -276,7 +308,7 @@ class _VideoPlayer(Gtk.Box):
             self._duration_ns = dur
 
     # ------------------------------------------------------------------
-    # Position polling
+    # Position polling — drives the scrubber during playback
     # ------------------------------------------------------------------
 
     def _start_poll(self) -> None:
@@ -289,12 +321,14 @@ class _VideoPlayer(Gtk.Box):
             self._poll_id = None
 
     def _poll_position(self) -> bool:
+        """Query pipeline position every 500 ms and advance the scrubber."""
         if self._player is None:
             return GLib.SOURCE_REMOVE
         if self._seeking:
             return GLib.SOURCE_CONTINUE
 
-        # Refresh duration if not yet known.
+        # Try to learn duration if it wasn't available at load time
+        # (common for HTTP streams where Content-Length is returned after buffering).
         if self._duration_ns <= 0:
             ok, dur = self._player.query_duration(Gst.Format.TIME)
             if ok and dur > 0:

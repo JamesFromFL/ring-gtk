@@ -241,6 +241,19 @@ class LiveStreamView(Gtk.Box):
         self._video_caps_set = False
         self._audio_caps_set = False
         self._last_frame_rgb = None
+
+        # The pipeline may be in NULL state from a previous stop() call.
+        # Transition NULL → PLAYING so that incoming appsrc buffers are accepted.
+        # Reset the video appsrc caps to format-only so width/height are
+        # re-negotiated from the first decoded frame of the new stream.
+        if self._pipeline is not None:
+            self._pipeline.set_state(Gst.State.NULL)
+            if self._video_appsrc is not None:
+                self._video_appsrc.set_property(
+                    "caps", Gst.Caps.from_string("video/x-raw,format=RGB")
+                )
+            self._pipeline.set_state(Gst.State.PLAYING)
+
         self._set_status("Connecting…")
 
         from ring_gtk.ring_client import get_client
