@@ -4,27 +4,8 @@ through a dual-chain GStreamer pipeline:
   Video: appsrc → videoconvert → gtk4paintablesink
   Audio: appsrc → audioconvert → audioresample → volume → autoaudiosink
 
-Flow
-----
-1. Dialog opens; GStreamer pipeline is created and the gtk4paintablesink
-   paintable is immediately wired to a Gtk.Picture (blank until frames arrive).
-2. _async_start() runs on the ring-client background asyncio loop:
-   - Creates an aiortc RTCPeerConnection with Ring's ICE servers.
-   - Adds recvonly transceivers for video and audio.
-   - Creates the SDP offer and calls generate_async_webrtc_stream() so Ring
-     negotiates asynchronously via the on_rtc_message callback.
-3. on_rtc_message is called from the websocket reader coroutine (on the asyncio
-   loop), so loop.create_task() safely schedules setRemoteDescription /
-   addIceCandidate without blocking the reader.
-4. When @pc.on("track") fires, _receive_frames() starts for video and
-   _receive_audio_frames() starts for audio. Each pull frames from their
-   respective aiortc tracks and push raw buffers into the matching appsrc.
-   Caps on the audio appsrc are set dynamically from the first frame so any
-   format aiortc delivers (s16 packed or fltp planar) is handled correctly;
-   audioconvert takes it from there.
-5. On dialog close the "closed" signal fires _on_closed(), which submits
-   _async_cleanup() to cancel both tasks, close the WebRTC stream, and close
-   the RTCPeerConnection; the GStreamer pipeline is also set to NULL.
+LiveStreamView is the core embeddable widget.  LiveStreamDialog wraps it in an
+Adw.Dialog for the classic pop-up mode (kept for compatibility).
 """
 
 from __future__ import annotations
@@ -169,12 +150,21 @@ _AV_TO_GST_FMT: dict[str, str] = {
 }
 
 
-class LiveStreamDialog(Adw.Dialog):
-    """Adw.Dialog that shows a live Ring camera feed with audio."""
+class LiveStreamView(Gtk.Box):
+    """Embeddable live camera feed widget — GStreamer + WebRTC, no dialog chrome.
 
-    def __init__(self, device) -> None:
-        super().__init__(title=device.name, content_width=854, content_height=520)
-        self._device = device
+    Usage::
+
+        view = LiveStreamView()
+        view.start_for_device(device)   # begins WebRTC negotiation
+        ...
+        view.stop()                     # call on widget destruction / navigation
+        png = view.get_current_frame_png()  # for screenshot
+    """
+
+    def __init__(self) -> None:
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, hexpand=True, vexpand=True)
+        self._device = None
         self._session_id: str | None = None
         self._pc = None
         self._video_task: asyncio.Task | None = None
@@ -185,19 +175,19 @@ class LiveStreamDialog(Adw.Dialog):
         self._vol_element: Gst.Element | None = None
         self._video_caps_set = False
         self._audio_caps_set = False
+        # Last decoded frame as a raw numpy array (h, w, 3) — updated every frame.
+        # Read from GTK thread for screenshots; written from asyncio thread.
+        # Single-reference replacement is safe under the GIL.
+        self._last_frame_rgb = None
 
+        self._build_pipeline()
         self._build_ui()
-        self.connect("closed", self._on_closed)
-        self._start_stream()
 
     # ------------------------------------------------------------------
-    # UI
+    # GStreamer pipeline
     # ------------------------------------------------------------------
 
-    def _build_ui(self) -> None:
-        # Two independent chains in one GStreamer pipeline.
-        # Video: appsrc → videoconvert → gtk4paintablesink
-        # Audio: appsrc → audioconvert → audioresample → volume → autoaudiosink
+    def _build_pipeline(self) -> None:
         self._pipeline = Gst.parse_launch(
             "appsrc name=vsrc format=time is-live=true do-timestamp=true "
             "! videoconvert "
@@ -211,40 +201,22 @@ class LiveStreamDialog(Adw.Dialog):
         self._video_appsrc = self._pipeline.get_by_name("vsrc")
         self._audio_appsrc = self._pipeline.get_by_name("asrc")
         self._vol_element = self._pipeline.get_by_name("vol")
-        paintable = self._pipeline.get_by_name("vsink").get_property("paintable")
+        self._paintable = self._pipeline.get_by_name("vsink").get_property("paintable")
 
-        # Pre-declare the pixel format on the video appsrc so downstream
-        # elements can negotiate format before the first frame arrives.
-        # Width and height are intentionally omitted here — they are set on the
-        # first decoded frame (where the actual camera resolution is known).
+        # Pre-declare pixel format only; width/height set on first real frame.
         self._video_appsrc.set_property("caps", Gst.Caps.from_string("video/x-raw,format=RGB"))
+        self._pipeline.set_state(Gst.State.PLAYING)
 
-        toolbar_view = Adw.ToolbarView()
-        self.set_child(toolbar_view)
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
 
-        header = Adw.HeaderBar()
-        toolbar_view.add_top_bar(header)
-
-        # Volume control: speaker icon + horizontal scale packed into the header.
-        vol_box = Gtk.Box(
-            orientation=Gtk.Orientation.HORIZONTAL,
-            spacing=4,
-            valign=Gtk.Align.CENTER,
-        )
-        vol_box.append(Gtk.Image(icon_name="audio-volume-high-symbolic"))
-        vol_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 1.0, 0.05)
-        vol_scale.set_value(1.0)
-        vol_scale.set_draw_value(False)
-        vol_scale.set_size_request(120, -1)
-        vol_scale.connect("value-changed", self._on_volume_changed)
-        vol_box.append(vol_scale)
-        header.pack_end(vol_box)
-
+    def _build_ui(self) -> None:
         overlay = Gtk.Overlay(hexpand=True, vexpand=True)
-        toolbar_view.set_content(overlay)
+        self.append(overlay)
 
         video = Gtk.Picture(
-            paintable=paintable,
+            paintable=self._paintable,
             content_fit=Gtk.ContentFit.CONTAIN,
             hexpand=True,
             vexpand=True,
@@ -259,21 +231,18 @@ class LiveStreamDialog(Adw.Dialog):
         )
         overlay.add_overlay(self._status_label)
 
-        self._pipeline.set_state(Gst.State.PLAYING)
-
     # ------------------------------------------------------------------
-    # Volume control
+    # Public API
     # ------------------------------------------------------------------
 
-    def _on_volume_changed(self, scale: Gtk.Scale) -> None:
-        if self._vol_element is not None:
-            self._vol_element.set_property("volume", scale.get_value())
+    def start_for_device(self, device) -> None:
+        """Begin WebRTC negotiation for *device*.  Safe to call from GTK thread."""
+        self._device = device
+        self._video_caps_set = False
+        self._audio_caps_set = False
+        self._last_frame_rgb = None
+        self._set_status("Connecting…")
 
-    # ------------------------------------------------------------------
-    # Stream startup
-    # ------------------------------------------------------------------
-
-    def _start_stream(self) -> None:
         from ring_gtk.ring_client import get_client
 
         client = get_client()
@@ -283,6 +252,45 @@ class LiveStreamDialog(Adw.Dialog):
             self._async_start(client),
             client._ensure_loop(),
         )
+
+    def stop(self) -> None:
+        """Stop WebRTC and GStreamer.  Safe to call from GTK thread."""
+        from ring_gtk.ring_client import get_client
+
+        client = get_client()
+        if client is not None and (self._session_id or self._pc):
+            asyncio.run_coroutine_threadsafe(
+                self._async_cleanup(),
+                client._ensure_loop(),
+            )
+        if self._pipeline is not None:
+            self._pipeline.set_state(Gst.State.NULL)
+
+    def set_volume(self, value: float) -> None:
+        if self._vol_element is not None:
+            self._vol_element.set_property("volume", max(0.0, min(1.0, value)))
+
+    def get_current_frame_png(self) -> bytes | None:
+        """Return the most recently decoded video frame as PNG bytes, or None."""
+        arr = self._last_frame_rgb
+        if arr is None:
+            return None
+        try:
+            import io
+
+            from PIL import Image
+
+            img = Image.fromarray(arr, "RGB")
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue()
+        except Exception as exc:
+            _log.debug("Screenshot encode failed: %s", exc)
+            return None
+
+    # ------------------------------------------------------------------
+    # Stream startup — asyncio loop
+    # ------------------------------------------------------------------
 
     async def _async_start(self, client) -> None:
         from aiortc import (
@@ -305,8 +313,6 @@ class LiveStreamDialog(Adw.Dialog):
         pc.addTransceiver("video", direction="recvonly")
         pc.addTransceiver("audio", direction="recvonly")
 
-        # ---- callbacks from the ring-doorbell websocket reader (asyncio loop) ----
-
         def on_rtc_message(msg) -> None:
             if msg.answer:
                 loop.create_task(
@@ -325,8 +331,6 @@ class LiveStreamDialog(Adw.Dialog):
                     self._set_status,
                     f"Stream error {msg.error_code}: {msg.error_message}",
                 )
-
-        # ---- aiortc event handlers ----
 
         @pc.on("icecandidate")
         def on_icecandidate(candidate) -> None:
@@ -348,12 +352,9 @@ class LiveStreamDialog(Adw.Dialog):
             elif track.kind == "audio":
                 self._audio_task = loop.create_task(self._receive_audio_frames(track))
 
-        # ---- SDP offer/answer ----
-
         try:
             offer = await pc.createOffer()
             await pc.setLocalDescription(offer)
-
             await self._device.generate_async_webrtc_stream(
                 pc.localDescription.sdp,
                 session_id,
@@ -370,7 +371,7 @@ class LiveStreamDialog(Adw.Dialog):
             GLib.idle_add(self._set_status, f"Failed to connect: {exc}")
 
     # ------------------------------------------------------------------
-    # Video frame loop — runs on the asyncio loop
+    # Video frame loop — asyncio loop
     # ------------------------------------------------------------------
 
     async def _receive_frames(self, track) -> None:
@@ -380,15 +381,14 @@ class LiveStreamDialog(Adw.Dialog):
         _log.debug("Video frame receiver started")
         while True:
             try:
-                frame = await track.recv()  # av.VideoFrame (decoded H.264)
+                frame = await track.recv()
                 rgb = frame.to_ndarray(format="rgb24")
                 h, w = rgb.shape[:2]
 
-                # GStreamer requires each row's stride to be a multiple of 4 bytes.
-                # For RGB (3 bytes/pixel), stride = width×3 must be divisible by 4.
-                # Widths like 1274 (stride 3822, not divisible by 4) or 720 (stride
-                # 2160, not divisible by 4) cause buffer-size mismatches and heap
-                # corruption.  Pad width up to the nearest multiple of 4.
+                # Store the un-padded frame for screenshots.
+                self._last_frame_rgb = rgb
+
+                # GStreamer requires RGB row stride to be a multiple of 4 bytes.
                 w_caps = (w + 3) & ~3
                 if w_caps != w:
                     padded = np.zeros((h, w_caps, 3), dtype=np.uint8)
@@ -422,7 +422,7 @@ class LiveStreamDialog(Adw.Dialog):
         GLib.idle_add(self._on_stream_ended)
 
     # ------------------------------------------------------------------
-    # Audio frame loop — runs on the asyncio loop
+    # Audio frame loop — asyncio loop
     # ------------------------------------------------------------------
 
     async def _receive_audio_frames(self, track) -> None:
@@ -431,7 +431,7 @@ class LiveStreamDialog(Adw.Dialog):
         _log.debug("Audio frame receiver started")
         while True:
             try:
-                frame = await track.recv()  # av.AudioFrame (decoded Opus)
+                frame = await track.recv()
                 arr = frame.to_ndarray()
                 raw: bytes = arr.tobytes()
 
@@ -439,9 +439,6 @@ class LiveStreamDialog(Adw.Dialog):
                     fmt_name = frame.format.name
                     gst_fmt = _AV_TO_GST_FMT.get(fmt_name, "S16LE")
                     layout = "non-interleaved" if frame.format.is_planar else "interleaved"
-                    # Derive channel count from array shape:
-                    #   planar  → shape (channels, samples)
-                    #   packed  → shape (1, samples * channels)
                     if frame.format.is_planar:
                         channels = arr.shape[0]
                     else:
@@ -453,13 +450,7 @@ class LiveStreamDialog(Adw.Dialog):
                     )
                     self._audio_appsrc.set_property("caps", Gst.Caps.from_string(caps_str))
                     self._audio_caps_set = True
-                    _log.debug(
-                        "Audio stream: %s %s %dch %dHz",
-                        gst_fmt,
-                        layout,
-                        channels,
-                        rate,
-                    )
+                    _log.debug("Audio stream: %s %s %dch %dHz", gst_fmt, layout, channels, rate)
 
                 self._audio_appsrc.emit("push-buffer", Gst.Buffer.new_wrapped(raw))
 
@@ -473,38 +464,8 @@ class LiveStreamDialog(Adw.Dialog):
                 break
 
     # ------------------------------------------------------------------
-    # GTK-thread status helpers
+    # Cleanup — asyncio loop
     # ------------------------------------------------------------------
-
-    def _on_connected(self) -> bool:
-        self._status_label.set_visible(False)
-        return GLib.SOURCE_REMOVE
-
-    def _set_status(self, message: str) -> bool:
-        self._status_label.set_label(message)
-        self._status_label.set_visible(True)
-        return GLib.SOURCE_REMOVE
-
-    def _on_stream_ended(self) -> bool:
-        self._set_status("Stream ended")
-        return GLib.SOURCE_REMOVE
-
-    # ------------------------------------------------------------------
-    # Cleanup on dialog close
-    # ------------------------------------------------------------------
-
-    def _on_closed(self, *_) -> None:
-        from ring_gtk.ring_client import get_client
-
-        client = get_client()
-        if client is not None and (self._session_id or self._pc):
-            asyncio.run_coroutine_threadsafe(
-                self._async_cleanup(),
-                client._ensure_loop(),
-            )
-        if self._pipeline is not None:
-            self._pipeline.set_state(Gst.State.NULL)
-            self._pipeline = None
 
     async def _async_cleanup(self) -> None:
         for task in (self._video_task, self._audio_task):
@@ -528,3 +489,54 @@ class LiveStreamDialog(Adw.Dialog):
             except Exception as exc:
                 _log.debug("Error closing RTCPeerConnection: %s", exc)
             self._pc = None
+
+    # ------------------------------------------------------------------
+    # GTK-thread status helpers
+    # ------------------------------------------------------------------
+
+    def _set_status(self, message: str) -> bool:
+        self._status_label.set_label(message)
+        self._status_label.set_visible(True)
+        return GLib.SOURCE_REMOVE
+
+    def _on_connected(self) -> bool:
+        self._status_label.set_visible(False)
+        return GLib.SOURCE_REMOVE
+
+    def _on_stream_ended(self) -> bool:
+        self._set_status("Stream ended")
+        return GLib.SOURCE_REMOVE
+
+
+class LiveStreamDialog(Adw.Dialog):
+    """Adw.Dialog wrapper around LiveStreamView (pop-up mode)."""
+
+    def __init__(self, device) -> None:
+        super().__init__(title=device.name, content_width=854, content_height=520)
+        self._view = LiveStreamView()
+
+        toolbar_view = Adw.ToolbarView()
+        self.set_child(toolbar_view)
+
+        header = Adw.HeaderBar()
+        toolbar_view.add_top_bar(header)
+
+        # Volume control in the header bar.
+        vol_box = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=4,
+            valign=Gtk.Align.CENTER,
+        )
+        vol_box.append(Gtk.Image(icon_name="audio-volume-high-symbolic"))
+        vol_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 1.0, 0.05)
+        vol_scale.set_value(1.0)
+        vol_scale.set_draw_value(False)
+        vol_scale.set_size_request(120, -1)
+        vol_scale.connect("value-changed", lambda s: self._view.set_volume(s.get_value()))
+        vol_box.append(vol_scale)
+        header.pack_end(vol_box)
+
+        toolbar_view.set_content(self._view)
+
+        self.connect("closed", lambda *_: self._view.stop())
+        self._view.start_for_device(device)
