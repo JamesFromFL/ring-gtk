@@ -46,37 +46,79 @@ _log = logging.getLogger(__name__)
 
 
 def _patch_aiortc_h264() -> None:
-    """Monkey-patch aiortc's H264Decoder for compatibility with Ring cameras.
+    """Monkey-patch aiortc for H264 compatibility with Ring cameras.
 
-    Ring cameras (particularly stickup_cam_mini_v3) negotiate Baseline H264
-    in the SDP but send B-frames (common in Main/High profile streams).
-    FFmpeg's H264 decoder returns AVERROR_INVALIDDATA for these frames when
-    strict profile checking is active.
+    Two patches are applied:
 
-    Fix: set skip_frame = "NONREF" directly on the av.CodecContext object
-    (not via the options dict) after it is created in H264Decoder.__init__.
-    This tells the decoder to discard non-reference frames without raising
-    an error, keeping the stream alive at the cost of skipping B-frames.
-    The codec opens lazily on the first decode() call, so the attribute is
-    applied before any packet is processed.
+    1. SDP offer: add packetization-mode=0 H264 codec variants alongside the
+       default mode=1 entries.  aiortc only advertises mode=1 by default;
+       Ring cameras (e.g. stickup_cam_mini_v3) may answer with mode=0 (or
+       omit packetization-mode, which RFC 6184 defines as mode=0).
+       is_codec_compatible() requires an exact mode match, so without mode=0
+       in the offer, setRemoteDescription() raises OperationError and no video
+       track is established for those cameras.
+
+    2. H264Decoder: set AV_CODEC_FLAG_OUTPUT_CORRUPT (0x8) on the av.CodecContext
+       before the first decode.  Ring cameras occasionally produce IDR frames
+       (keyframes) that fail avcodec_send_packet() with AVERROR_INVALIDDATA.
+       With this flag, FFmpeg outputs the partially-decoded frame with error
+       concealment rather than silently dropping it, so the stream recovers
+       immediately instead of staying blank until the next keyframe (~2 s).
+       The codec opens lazily on the first decode() call, so the flag is
+       applied in time.
     """
     try:
+        from aiortc.codecs import CODECS
         from aiortc.codecs.h264 import H264Decoder
+        from aiortc.rtcrtpparameters import RTCRtcpFeedback, RTCRtpCodecParameters
 
+        # --- Patch 1: add packetization-mode=0 H264 codecs to the SDP offer ---
+        existing_modes = {
+            c.parameters.get("packetization-mode")
+            for c in CODECS["video"]
+            if c.mimeType.lower() == "video/h264"
+        }
+        if "0" not in existing_modes:
+            base_pt = max((c.payloadType for c in CODECS["video"]), default=102) + 1
+            for profile_level_id in ("42001f", "42e01f"):
+                CODECS["video"].append(
+                    RTCRtpCodecParameters(
+                        mimeType="video/H264",
+                        clockRate=90000,
+                        payloadType=base_pt,
+                        rtcpFeedback=[
+                            RTCRtcpFeedback(type="nack"),
+                            RTCRtcpFeedback(type="nack", parameter="pli"),
+                            RTCRtcpFeedback(type="goog-remb"),
+                        ],
+                        parameters={
+                            "level-asymmetry-allowed": "1",
+                            "packetization-mode": "0",
+                            "profile-level-id": profile_level_id,
+                        },
+                    )
+                )
+                base_pt += 1
+            _log.debug("Added packetization-mode=0 H264 codecs to SDP offer")
+
+        # --- Patch 2: set AV_CODEC_FLAG_OUTPUT_CORRUPT on the H264Decoder ---
         _orig_init = H264Decoder.__init__
 
         def _permissive_init(self) -> None:
             _orig_init(self)
-            # skip_frame is a direct attribute on av.CodecContext (VideoCodecContext).
-            # NONREF = discard non-reference frames; B-frames from Ring cameras are
-            # often non-reference, so they are silently dropped rather than causing
-            # AVERROR_INVALIDDATA errors that would stall the decode loop.
-            self.codec.skip_frame = "NONREF"
+            # AV_CODEC_FLAG_OUTPUT_CORRUPT (1 << 3 = 0x8): instruct FFmpeg to
+            # output frames even when avcodec_send_packet() reports
+            # AVERROR_INVALIDDATA.  Ring cameras produce AVERROR_INVALIDDATA
+            # at every IDR (keyframe) boundary (~2 s interval); with this flag
+            # FFmpeg applies error concealment and outputs the best available
+            # frame rather than dropping it, allowing P-frames that follow to
+            # use it as a reference and keeping the stream visible.
+            self.codec.flags |= 0x8  # AV_CODEC_FLAG_OUTPUT_CORRUPT
 
         H264Decoder.__init__ = _permissive_init
-        _log.debug("Applied H264 decoder patch (skip_frame=NONREF)")
+        _log.debug("Applied H264 decoder patch (AV_CODEC_FLAG_OUTPUT_CORRUPT)")
     except Exception as exc:
-        _log.debug("Could not patch H264Decoder: %s", exc)
+        _log.debug("Could not apply H264 compatibility patches: %s", exc)
 
 
 _patch_aiortc_h264()
