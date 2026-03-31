@@ -67,19 +67,28 @@ class _VideoPlayer(Gtk.Box):
         self._build_ui()
 
     def _build_pipeline(self) -> None:
-        self._video_sink = Gst.ElementFactory.make("gtk4paintablesink", "vsink")
-        if self._video_sink is None:
-            _log.warning("gtk4paintablesink not available")
-            return
-        self._paintable = self._video_sink.get_property("paintable")
-
         self._player = Gst.ElementFactory.make("playbin", "player")
         if self._player is None:
             _log.warning("playbin not available")
             return
 
-        # Wrap the sink in a bin that handles the video pipeline internally.
-        self._player.set_property("video-sink", self._video_sink)
+        # Wrap gtk4paintablesink in a bin with videorate + capsfilter so that
+        # recordings with framerate=0/0 in container metadata don't trigger the
+        # GStreamer-CRITICAL assertion 'a_d != 0' in gst_value_set_fraction().
+        video_bin = Gst.parse_bin_from_description(
+            "videorate ! video/x-raw,framerate=30/1 ! gtk4paintablesink name=vsink sync=false",
+            True,  # ghost_unlinked_pads — exposes the sink pad on the bin
+        )
+        if video_bin is None:
+            _log.warning("Failed to create video bin — gtk4paintablesink may be missing")
+            return
+
+        self._video_sink = video_bin.get_by_name("vsink")
+        if self._video_sink is None:
+            _log.warning("gtk4paintablesink not found inside video bin")
+            return
+        self._paintable = self._video_sink.get_property("paintable")
+        self._player.set_property("video-sink", video_bin)
 
         bus = self._player.get_bus()
         bus.add_signal_watch()
@@ -116,8 +125,11 @@ class _VideoPlayer(Gtk.Box):
         self._scrubber.set_draw_value(False)
         self._scrubber.set_margin_start(12)
         self._scrubber.set_margin_end(12)
-        self._scrubber.connect("button-press-event", lambda *_: setattr(self, "_seeking", True))
-        self._scrubber.connect("button-release-event", self._on_scrubber_released)
+        # GTK4: use GestureClick instead of the removed button-press/release-event signals.
+        press_gesture = Gtk.GestureClick.new()
+        press_gesture.connect("pressed", lambda *_: setattr(self, "_seeking", True))
+        press_gesture.connect("released", lambda *_: self._on_scrubber_released())
+        self._scrubber.add_controller(press_gesture)
         self._scrubber.connect("change-value", self._on_scrubber_changed)
         self.append(self._scrubber)
 
