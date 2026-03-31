@@ -17,6 +17,22 @@ from ring_gtk.ring_client import get_client  # noqa: E402
 _log = logging.getLogger(__name__)
 
 
+def _make_grey_placeholder() -> bytes:
+    """Return a small dark-grey PNG for cameras whose snapshot fetch failed."""
+    try:
+        import io
+
+        from PIL import Image
+
+        img = Image.new("RGB", (160, 90), color=(48, 48, 48))
+        out = io.BytesIO()
+        img.save(out, format="PNG")
+        return out.getvalue()
+    except Exception as exc:
+        _log.debug("placeholder creation failed: %s", exc)
+        return b""
+
+
 def _apply_motion_off_overlay(png_bytes: bytes) -> bytes:
     """Return a blurred copy of *png_bytes* with a 'Motion Detection Off' label.
 
@@ -239,8 +255,19 @@ class RingWindow(Adw.ApplicationWindow):
                 GLib.idle_add(self._set_snapshot, device.id, img)
             else:
                 _log.debug("No snapshot returned for %s", device.name)
+                if not getattr(device, "motion_detection", True):
+                    img = _apply_motion_off_overlay(_make_grey_placeholder())
+                    if img:
+                        GLib.idle_add(self._set_snapshot, device.id, img)
         except Exception as exc:
             _log.debug("Snapshot fetch failed for %s: %s", device.name, exc)
+            # Ring returns empty timestamps list for some cameras; even when the
+            # fetch fails, show the "Motion Detection Off" overlay on a placeholder
+            # so the user knows why the thumbnail is missing.
+            if not getattr(device, "motion_detection", True):
+                img = _apply_motion_off_overlay(_make_grey_placeholder())
+                if img:
+                    GLib.idle_add(self._set_snapshot, device.id, img)
 
     def _set_snapshot(self, device_id: int, png_bytes: bytes) -> bool:
         """Decode PNG bytes and paint the thumbnail (GTK main thread)."""

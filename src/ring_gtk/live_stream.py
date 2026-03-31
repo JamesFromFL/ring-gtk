@@ -46,32 +46,46 @@ _log = logging.getLogger(__name__)
 
 
 def _patch_aiortc_h264() -> None:
-    """Monkey-patch aiortc's H264Decoder to relax error detection.
+    """Monkey-patch aiortc's H264Decoder for compatibility with Ring cameras.
 
-    Ring cameras (particularly newer stickup_cam_mini variants) often send
-    H264 bitstreams that use Main or High profile features (e.g. B-frames)
-    even though aiortc negotiates Baseline profile in the SDP offer.  FFmpeg
-    rejects these packets with "Invalid data found when processing input"
-    because they violate the negotiated profile constraints.
+    Ring cameras (particularly stickup_cam_mini_v3 and some floodlight models)
+    send H264 bitstreams using Main/High profile features (B-frames, etc.)
+    even though aiortc negotiates Baseline in the SDP offer.  Two changes:
 
-    Setting err_detect=0 tells FFmpeg not to treat profile violations as
-    fatal errors, allowing it to decode the frames best-effort.  The patch
-    is applied once when this module is imported, before any RTCPeerConnection
-    is created.
+    1. Set codec.flags2 = 1 (AV_CODEC_FLAG2_FAST) before the codec context
+       opens on its first decode call.  This is the correct PyAV attribute for
+       permitting non-spec-compliant bitstream tricks; setting options['err_detect']
+       targets soft error reporting and has no effect on AVERROR_INVALIDDATA.
+
+    2. Patch decode() to flush the codec after any FFmpegError.  B-frame
+       reference failures cascade: once one frame is dropped, every B-frame
+       that references it also fails.  Flushing releases internal references
+       so the next IDR keyframe starts a clean decode sequence.
     """
     try:
         from aiortc.codecs.h264 import H264Decoder
 
         _orig_init = H264Decoder.__init__
+        _orig_decode = H264Decoder.decode
 
         def _permissive_init(self) -> None:
             _orig_init(self)
-            # Disable bitstream error detection so non-baseline streams
-            # (B-frames, high profile) are decoded rather than dropped.
-            self.codec.options = {"err_detect": "0"}
+            # AV_CODEC_FLAG2_FAST (0x1) — allow non-spec-compliant speedup tricks.
+            # Must be set before the first decode() call (codec opens lazily).
+            self.codec.flags2 = 1
+
+        def _resilient_decode(self, encoded_frame):
+            frames = _orig_decode(self, encoded_frame)
+            if not frames:
+                # Flush decoder state so the next keyframe starts clean,
+                # preventing cascading reference failures from B-frames.
+                with contextlib.suppress(Exception):
+                    self.codec.decode(None)
+            return frames
 
         H264Decoder.__init__ = _permissive_init
-        _log.debug("Applied permissive H264 decoder patch")
+        H264Decoder.decode = _resilient_decode
+        _log.debug("Applied permissive H264 decoder patch (flags2=FAST, flush-on-error)")
     except Exception as exc:
         _log.debug("Could not patch H264Decoder: %s", exc)
 
@@ -312,13 +326,18 @@ class LiveStreamDialog(Adw.Dialog):
         while True:
             try:
                 frame = await track.recv()  # av.VideoFrame (decoded H.264)
-                rgb = frame.to_ndarray(format="rgb24")
-                h, w = rgb.shape[:2]
-                raw: bytes = rgb.tobytes()
+                # Use RGBA (4 bytes/pixel) rather than RGB (3 bytes/pixel).
+                # GStreamer computes stride for RGB as GST_ROUND_UP_4(width*3),
+                # so widths like 1274 produce a 2-byte gap per row that causes
+                # every buffer to be silently discarded.  RGBA stride = width*4
+                # is always 4-byte-aligned for any width.
+                rgba = frame.to_ndarray(format="rgba")
+                h, w = rgba.shape[:2]
+                raw: bytes = rgba.tobytes()
 
                 if not self._video_caps_set:
                     caps = Gst.Caps.from_string(
-                        f"video/x-raw,format=RGB,width={w},height={h},framerate=0/1"
+                        f"video/x-raw,format=RGBA,width={w},height={h},framerate=0/1"
                     )
                     self._video_appsrc.set_property("caps", caps)
                     self._video_caps_set = True
