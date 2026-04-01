@@ -10,19 +10,26 @@ from gi.repository import Gtk  # noqa: E402
 
 from halo_gtk import APP_ID  # noqa: E402
 
-_ICON_PNG_FALLBACK = (
-    __file__,  # resolved at runtime relative to package location
-)
 
+class HomePage(Gtk.ScrolledWindow):
+    """Centered branding shown when the app first opens.
 
-class HomePage(Gtk.Box):
-    """Centered branding shown when the app first opens."""
+    Implemented as a ScrolledWindow so the content stays centered when the
+    window is large and scrolls vertically when the window is too short to
+    show everything at once.
+    """
 
     def __init__(self) -> None:
         super().__init__(
-            orientation=Gtk.Orientation.VERTICAL,
+            hscrollbar_policy=Gtk.PolicyType.NEVER,
+            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
             hexpand=True,
             vexpand=True,
+        )
+        # Inner box: no vexpand so the ScrolledWindow scrolls when the
+        # natural height exceeds the allocated viewport height.
+        self._inner = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
             halign=Gtk.Align.CENTER,
             valign=Gtk.Align.CENTER,
             spacing=20,
@@ -31,6 +38,7 @@ class HomePage(Gtk.Box):
             margin_start=32,
             margin_end=32,
         )
+        self.set_child(self._inner)
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -39,10 +47,10 @@ class HomePage(Gtk.Box):
             css_classes=["title-1"],
             halign=Gtk.Align.CENTER,
         )
-        self.append(title)
+        self._inner.append(title)
 
         icon = self._make_icon()
-        self.append(icon)
+        self._inner.append(icon)
 
         description = Gtk.Label(
             label="A Linux native desktop client for Ring home security.",
@@ -52,14 +60,14 @@ class HomePage(Gtk.Box):
             justify=Gtk.Justification.CENTER,
             max_width_chars=50,
         )
-        self.append(description)
+        self._inner.append(description)
 
         notice_box = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL,
             spacing=4,
             halign=Gtk.Align.CENTER,
         )
-        self.append(notice_box)
+        self._inner.append(notice_box)
 
         notice = Gtk.Label(
             label=(

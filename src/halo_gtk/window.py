@@ -126,7 +126,20 @@ class RingWindow(Adw.ApplicationWindow):
             hexpand=True,
             vexpand=True,
         )
-        self._split_view.set_content(self._content_stack)
+        # Wrap the page stack in a scroll container.  This caps the minimum
+        # height reported to the OverlaySplitView at ~0 so the window can
+        # shrink freely without clipping the header bar.  Each page handles
+        # its own internal scrolling; this wrapper only scrolls when a page
+        # has no vexpand and its natural height exceeds the viewport (i.e.
+        # the Home page when the window is very short).
+        content_scroll = Gtk.ScrolledWindow(
+            hscrollbar_policy=Gtk.PolicyType.NEVER,
+            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+            hexpand=True,
+            vexpand=True,
+        )
+        content_scroll.set_child(self._content_stack)
+        self._split_view.set_content(content_scroll)
 
         self._home_page = HomePage()
         self._content_stack.add_named(self._home_page, "home")
