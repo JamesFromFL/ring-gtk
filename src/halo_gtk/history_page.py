@@ -358,6 +358,13 @@ class HistoryPage(Gtk.Box):
         self._current_event = None
         self._build_ui()
 
+    def do_size_allocate(self, width: int, height: int, baseline: int) -> None:
+        """Collapse the NavigationSplitView when the page is narrower than 700 px."""
+        Gtk.Box.do_size_allocate(self, width, height, baseline)
+        should_collapse = width < 700
+        if self._nav_split.get_collapsed() != should_collapse:
+            self._nav_split.set_collapsed(should_collapse)
+
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
@@ -366,7 +373,7 @@ class HistoryPage(Gtk.Box):
         self._nav_split = Adw.NavigationSplitView(
             hexpand=True,
             vexpand=True,
-            min_sidebar_width=280,
+            min_sidebar_width=200,
             max_sidebar_width=340,
         )
         self.append(self._nav_split)

@@ -45,6 +45,11 @@ class RingWindow(Adw.ApplicationWindow):
             default_height=720,
             **kwargs,
         )
+        # Absolute minimum the app will attempt to render into.  Tiled
+        # Wayland compositors (e.g. Hyprland) can force any size; setting a
+        # size_request gives GTK a floor so it never allocates zero pixels
+        # to widgets.
+        self.set_size_request(400, 300)
         self._build_ui()
         self.refresh()
 
@@ -56,10 +61,13 @@ class RingWindow(Adw.ApplicationWindow):
         # Root: OverlaySplitView — collapsible sidebar + content area.
         self._split_view = Adw.OverlaySplitView(
             sidebar_width_fraction=0.20,
-            min_sidebar_width=180,
+            min_sidebar_width=160,
             max_sidebar_width=240,
             collapsed=False,
         )
+        # Keep the toggle button in sync when the sidebar collapses/uncollapses
+        # (triggered automatically by do_size_allocate when the window is narrow).
+        self._split_view.connect("notify::collapsed", self._on_collapsed_changed)
 
         # Outer ToolbarView holds the header bar and the split view.
         outer_toolbar = Adw.ToolbarView()
@@ -71,13 +79,13 @@ class RingWindow(Adw.ApplicationWindow):
         outer_toolbar.add_top_bar(header)
 
         # Hamburger / sidebar toggle button.
-        toggle_btn = Gtk.ToggleButton(
+        self._toggle_btn = Gtk.ToggleButton(
             icon_name="sidebar-show-symbolic",
             tooltip_text="Toggle sidebar",
             active=True,
         )
-        toggle_btn.connect("toggled", self._on_sidebar_toggled)
-        header.pack_start(toggle_btn)
+        self._toggle_btn.connect("toggled", self._on_sidebar_toggled)
+        header.pack_start(self._toggle_btn)
 
         menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic", tooltip_text="Menu")
         menu_btn.set_menu_model(self._build_menu())
@@ -217,6 +225,28 @@ class RingWindow(Adw.ApplicationWindow):
 
     def _on_sidebar_toggled(self, btn: Gtk.ToggleButton) -> None:
         self._split_view.set_show_sidebar(btn.get_active())
+
+    def _on_collapsed_changed(self, split_view: Adw.OverlaySplitView, _) -> None:
+        """Sync the toggle button when the sidebar collapses or uncollapses."""
+        collapsed = split_view.get_collapsed()
+        if collapsed:
+            # Overlay mode: hide the sidebar by default so it doesn't obscure content.
+            self._toggle_btn.set_active(False)
+        else:
+            # Pinned mode: show the sidebar again.
+            self._toggle_btn.set_active(True)
+
+    def do_size_allocate(self, width: int, height: int, baseline: int) -> None:
+        """Auto-collapse the sidebar when the window is narrower than 600 px.
+
+        Tiled Wayland compositors can set any window size regardless of the
+        size_request hint, so we must react to the actual allocated width here
+        rather than relying on requested sizes.
+        """
+        Adw.ApplicationWindow.do_size_allocate(self, width, height, baseline)
+        should_collapse = width < 500
+        if self._split_view.get_collapsed() != should_collapse:
+            self._split_view.set_collapsed(should_collapse)
 
     # ------------------------------------------------------------------
     # Refresh — called after auth and by the refresh button

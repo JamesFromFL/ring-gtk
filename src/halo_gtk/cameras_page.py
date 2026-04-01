@@ -24,8 +24,10 @@ _log = logging.getLogger(__name__)
 _SNAPSHOT_FAMILIES = frozenset({"doorbots", "authorized_doorbots", "stickup_cams"})
 
 # Default tile dimensions (16:9) before any snapshot is loaded.
-_DEFAULT_NATIVE_W = 1280
-_DEFAULT_NATIVE_H = 720
+# Small placeholder so tiles impose no hard minimum on the window before a
+# real snapshot arrives.
+_DEFAULT_NATIVE_W = 320
+_DEFAULT_NATIVE_H = 180
 
 # Size mode: name → (fraction of native width, min tiles per row)
 _SIZE_MODES: dict[str, tuple[float, int]] = {
@@ -106,6 +108,11 @@ class CameraTile(Gtk.FlowBoxChild):
         self._native_h = _DEFAULT_NATIVE_H
         self._current_mode = "medium"
         self.set_focusable(True)
+        # Prevent tiles from stretching beyond their size_request in the FlowBox.
+        self.set_hexpand(False)
+        # Track last requested width to avoid redundant queue_resize calls from
+        # set_size_request() inside the FlowBox size-allocate handler.
+        self._req_w: int = 0
 
         # Card frame.
         self._frame = Gtk.Frame(css_classes=["card"])
@@ -161,11 +168,18 @@ class CameraTile(Gtk.FlowBoxChild):
     # ------------------------------------------------------------------
 
     def apply_size_mode(self, mode: str) -> None:
-        """Update width_request to match the given size mode and native resolution."""
+        """Store the new size mode; actual pixel width is set by the FlowBox
+        size-allocate callback so the tile never imposes a hard minimum on the
+        window width."""
         self._current_mode = mode
-        fraction, _ = _SIZE_MODES[mode]
-        w = max(80, int(self._native_w * fraction))
-        self.set_size_request(w, -1)
+        self._set_req_width(1)
+
+    def _set_req_width(self, w: int) -> None:
+        """Call set_size_request only when the value changes to avoid an
+        infinite layout loop from the size-allocate handler."""
+        if w != self._req_w:
+            self._req_w = w
+            self.set_size_request(w, -1)
 
     # ------------------------------------------------------------------
     # Snapshot
@@ -435,6 +449,7 @@ class CamerasPage(Gtk.Box):
         self._flow_box.set_min_children_per_line(min_per_line)
         self._flow_box.set_max_children_per_line(100)
         self._flow_box.connect("child-activated", self._on_child_activated)
+        self._flow_box.connect("size-allocate", self._on_flow_box_size_allocate)
         scroll.set_child(self._flow_box)
 
         # --- Live page ---
@@ -447,6 +462,28 @@ class CamerasPage(Gtk.Box):
     # ------------------------------------------------------------------
     # Size mode
     # ------------------------------------------------------------------
+
+    def _on_flow_box_size_allocate(
+        self, widget: Gtk.Widget, width: int, height: int, baseline: int
+    ) -> None:
+        """Recompute tile widths whenever the FlowBox is resized.
+
+        Tiles fill the available width divided by the minimum tiles per row,
+        capped at their native-resolution fraction so they never upscale past
+        their actual resolution.  Using the *allocated* width rather than the
+        native resolution as the driver means tiles shrink with the window and
+        never impose a hard minimum on it.
+        """
+        if not self._cards:
+            return
+        fraction, min_per_line = _SIZE_MODES[self._size_mode]
+        # FlowBox has margin_start/end of 5 px each and column_spacing of 5 px.
+        inner_w = width - 10
+        gap_total = max(0, min_per_line - 1) * 5
+        tile_w = max(1, (inner_w - gap_total) // min_per_line)
+        for tile in self._cards.values():
+            max_w = max(1, int(tile._native_w * fraction))
+            tile._set_req_width(min(tile_w, max_w))
 
     def _on_size_toggled(self, button: Gtk.ToggleButton, mode: str) -> None:
         if not button.get_active():
