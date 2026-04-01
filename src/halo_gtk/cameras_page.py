@@ -449,7 +449,6 @@ class CamerasPage(Gtk.Box):
         self._flow_box.set_min_children_per_line(min_per_line)
         self._flow_box.set_max_children_per_line(100)
         self._flow_box.connect("child-activated", self._on_child_activated)
-        self._flow_box.connect("size-allocate", self._on_flow_box_size_allocate)
         scroll.set_child(self._flow_box)
 
         # --- Live page ---
@@ -460,30 +459,30 @@ class CamerasPage(Gtk.Box):
         self._stack.add_named(self._live_panel, "live")
 
     # ------------------------------------------------------------------
-    # Size mode
+    # Size allocation — drives dynamic tile widths
     # ------------------------------------------------------------------
 
-    def _on_flow_box_size_allocate(
-        self, widget: Gtk.Widget, width: int, height: int, baseline: int
-    ) -> None:
-        """Recompute tile widths whenever the FlowBox is resized.
+    def do_size_allocate(self, width: int, height: int, baseline: int) -> None:
+        """Recompute tile widths on every allocation so tiles fill available
+        space without imposing a hard minimum on the window."""
+        Gtk.Box.do_size_allocate(self, width, height, baseline)
+        self._recalc_tile_widths(width)
 
-        Tiles fill the available width divided by the minimum tiles per row,
-        capped at their native-resolution fraction so they never upscale past
-        their actual resolution.  Using the *allocated* width rather than the
-        native resolution as the driver means tiles shrink with the window and
-        never impose a hard minimum on it.
-        """
+    def _recalc_tile_widths(self, available_width: int) -> None:
         if not self._cards:
             return
         fraction, min_per_line = _SIZE_MODES[self._size_mode]
         # FlowBox has margin_start/end of 5 px each and column_spacing of 5 px.
-        inner_w = width - 10
+        inner_w = available_width - 10
         gap_total = max(0, min_per_line - 1) * 5
         tile_w = max(1, (inner_w - gap_total) // min_per_line)
         for tile in self._cards.values():
             max_w = max(1, int(tile._native_w * fraction))
             tile._set_req_width(min(tile_w, max_w))
+
+    # ------------------------------------------------------------------
+    # Size mode
+    # ------------------------------------------------------------------
 
     def _on_size_toggled(self, button: Gtk.ToggleButton, mode: str) -> None:
         if not button.get_active():
@@ -493,6 +492,9 @@ class CamerasPage(Gtk.Box):
         self._flow_box.set_min_children_per_line(min_per_line)
         for tile in self._cards.values():
             tile.apply_size_mode(mode)
+        # Recalculate immediately; do_size_allocate only fires if the window
+        # width changes, but the mode change needs an instant tile resize.
+        self._recalc_tile_widths(self.get_width())
         cfg = _cfg.load()
         cfg["camera_grid_size"] = mode
         _cfg.save(cfg)
