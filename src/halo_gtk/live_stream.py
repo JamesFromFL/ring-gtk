@@ -544,7 +544,7 @@ class LiveStreamDialog(Adw.Dialog):
         vol_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 1.0, 0.05)
         vol_scale.set_value(1.0)
         vol_scale.set_draw_value(False)
-        vol_scale.set_size_request(120, -1)
+        vol_scale.set_size_request(80, -1)
         vol_scale.connect("value-changed", lambda s: self._view.set_volume(s.get_value()))
         vol_box.append(vol_scale)
         header.pack_end(vol_box)

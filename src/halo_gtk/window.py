@@ -61,8 +61,6 @@ class RingWindow(Adw.ApplicationWindow):
         # Root: OverlaySplitView — collapsible sidebar + content area.
         self._split_view = Adw.OverlaySplitView(
             sidebar_width_fraction=0.20,
-            min_sidebar_width=160,
-            max_sidebar_width=240,
             collapsed=False,
         )
         # Keep the toggle button in sync when the sidebar collapses/uncollapses

@@ -171,7 +171,7 @@ class _VideoPlayer(Gtk.Box):
         self._vol_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 1.0, 0.05)
         self._vol_scale.set_value(1.0)
         self._vol_scale.set_draw_value(False)
-        self._vol_scale.set_size_request(100, -1)
+        self._vol_scale.set_size_request(80, -1)
         self._vol_scale.connect("value-changed", self._on_volume_changed)
         vol_box.append(self._vol_scale)
         controls_row.append(vol_box)
@@ -373,8 +373,7 @@ class HistoryPage(Gtk.Box):
         self._nav_split = Adw.NavigationSplitView(
             hexpand=True,
             vexpand=True,
-            min_sidebar_width=200,
-            max_sidebar_width=340,
+            sidebar_width_fraction=0.3,
         )
         self.append(self._nav_split)
 
