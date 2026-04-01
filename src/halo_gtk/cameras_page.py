@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import logging
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -72,30 +73,42 @@ def _make_grey_placeholder() -> bytes:
 
 def _apply_motion_off_overlay(png_bytes: bytes) -> bytes:
     try:
-        from PIL import Image, ImageDraw, ImageFilter, ImageFont
+        import subprocess  # noqa: PLC0415
 
-        # Try DejaVuSans-Bold at 28 pt; fall back to Pillow's built-in default.
+        from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont  # noqa: PLC0415
+
+        # Query the system bold sans-serif font via fontconfig; fall back to
+        # Pillow's built-in bitmap default if fc-match is unavailable.
         font = None
-        for _font_path in (
-            "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
-        ):
-            try:
-                font = ImageFont.truetype(_font_path, 28)
-                break
-            except OSError:
-                pass
+        try:
+            result = subprocess.run(
+                ["fc-match", "--format=%{file}", "sans-serif:bold"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            font_path = result.stdout.strip()
+            if font_path:
+                font = ImageFont.truetype(font_path, 140)
+        except Exception:
+            pass
+        if font is None:
+            font = ImageFont.load_default()
 
         img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
-        img = img.filter(ImageFilter.GaussianBlur(radius=12))
+        # Three sequential Gaussian blur passes for a frosted-glass effect.
+        for _ in range(3):
+            img = img.filter(ImageFilter.GaussianBlur(radius=8))
+        # Darken slightly to increase text contrast.
+        img = ImageEnhance.Brightness(img).enhance(0.75)
         draw = ImageDraw.Draw(img)
         text = "Motion Detection Off"
         w, h = img.size
         bbox = draw.textbbox((0, 0), text, font=font)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
         x, y = (w - tw) // 2, (h - th) // 2
-        # 4-way drop shadow in black, then white foreground.
-        for dx, dy in ((-2, -2), (2, -2), (-2, 2), (2, 2)):
+        # 4-way drop shadow at 4 px offset in black, then white foreground.
+        for dx, dy in ((-4, -4), (4, -4), (-4, 4), (4, 4)):
             draw.text((x + dx, y + dy), text, fill=(0, 0, 0), font=font)
         draw.text((x, y), text, fill=(255, 255, 255), font=font)
         out = io.BytesIO()
@@ -118,6 +131,25 @@ def _make_dark_placeholder() -> bytes:
     except Exception as exc:
         _log.debug("dark placeholder creation failed: %s", exc)
         return b""
+
+
+_TIMER_CSS_PROVIDER: Gtk.CssProvider | None = None
+
+
+def _get_timer_css_provider() -> Gtk.CssProvider:
+    """Return a shared CssProvider for snapshot age timer labels (lazy init)."""
+    global _TIMER_CSS_PROVIDER
+    if _TIMER_CSS_PROVIDER is None:
+        _TIMER_CSS_PROVIDER = Gtk.CssProvider()
+        _TIMER_CSS_PROVIDER.load_from_string(
+            ".snapshot-timer {"
+            " background-color: rgba(0,0,0,0.5);"
+            " border-radius: 4px;"
+            " padding: 2px 6px;"
+            " color: white;"
+            "}"
+        )
+    return _TIMER_CSS_PROVIDER
 
 
 async def _fetch_last_event_frame(client, device) -> bytes | None:
@@ -189,6 +221,11 @@ class CameraTile(Gtk.FlowBoxChild):
         # set_size_request() inside the FlowBox size-allocate handler.
         self._req_w: int = 0
 
+        # Snapshot age timer state.
+        self._snapshot_loaded_at: float = 0.0
+        self._motion_detection_off: bool = False
+        self._timer_source_id: int | None = None
+
         # Card frame.
         self._frame = Gtk.Frame(css_classes=["card"])
         self.set_child(self._frame)
@@ -204,13 +241,28 @@ class CameraTile(Gtk.FlowBoxChild):
         )
         self._frame.set_child(box)
 
-        # Snapshot picture at native aspect ratio.
+        # Snapshot picture wrapped in an Overlay so the age timer badge can
+        # float in the bottom-left corner without affecting layout.
         self._picture = Gtk.Picture(
             content_fit=Gtk.ContentFit.CONTAIN,
             can_shrink=True,
             hexpand=True,
         )
-        box.append(self._picture)
+        self._timer_label = Gtk.Label(
+            css_classes=["caption", "numeric", "snapshot-timer"],
+            halign=Gtk.Align.START,
+            valign=Gtk.Align.END,
+            margin_start=4,
+            margin_bottom=4,
+            visible=False,
+        )
+        self._timer_label.get_style_context().add_provider(
+            _get_timer_css_provider(), Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+        picture_overlay = Gtk.Overlay()
+        picture_overlay.set_child(self._picture)
+        picture_overlay.add_overlay(self._timer_label)
+        box.append(picture_overlay)
 
         # Camera name label, centered.
         self._name_label = Gtk.Label(
@@ -220,6 +272,9 @@ class CameraTile(Gtk.FlowBoxChild):
             css_classes=["heading"],
         )
         box.append(self._name_label)
+
+        # Start the 1-second tick; it is a no-op while the timer label is hidden.
+        self._timer_source_id = GLib.timeout_add_seconds(1, self._update_timer)
 
         # Hover state.
         motion = Gtk.EventControllerMotion()
@@ -260,8 +315,12 @@ class CameraTile(Gtk.FlowBoxChild):
     # Snapshot
     # ------------------------------------------------------------------
 
-    def set_snapshot(self, png_bytes: bytes) -> None:
-        """Update the thumbnail from raw PNG bytes (GTK main thread)."""
+    def set_snapshot(self, png_bytes: bytes, *, motion_detection_off: bool = False) -> None:
+        """Update the thumbnail from raw PNG bytes (GTK main thread).
+
+        Pass ``motion_detection_off=True`` to hide the age timer (the image is
+        a static blurred still, so elapsed time is not meaningful).
+        """
         try:
             loader = GdkPixbuf.PixbufLoader()
             loader.write(png_bytes)
@@ -275,6 +334,41 @@ class CameraTile(Gtk.FlowBoxChild):
                 self.apply_size_mode(self._current_mode)
         except Exception as exc:
             _log.debug("CameraTile.set_snapshot failed for %s: %s", self.device.name, exc)
+
+        self._motion_detection_off = motion_detection_off
+        if motion_detection_off:
+            self._timer_label.set_visible(False)
+        else:
+            self._snapshot_loaded_at = time.monotonic()
+            self._timer_label.set_visible(True)
+            self._update_timer()  # Refresh text immediately; don't wait for next tick.
+
+    # ------------------------------------------------------------------
+    # Snapshot age timer
+    # ------------------------------------------------------------------
+
+    def _update_timer(self) -> bool:
+        """Tick callback: update the age badge text every second."""
+        if not self._timer_label.get_visible():
+            return GLib.SOURCE_CONTINUE
+        elapsed = int(time.monotonic() - self._snapshot_loaded_at)
+        h = elapsed // 3600
+        m = (elapsed % 3600) // 60
+        s = elapsed % 60
+        if h > 0:
+            text = f"{h}h {m}m {s}s"
+        elif m > 0:
+            text = f"{m}m {s}s"
+        else:
+            text = f"{s}s"
+        self._timer_label.set_label(text)
+        return GLib.SOURCE_CONTINUE
+
+    def cleanup(self) -> None:
+        """Cancel the GLib timer when the tile is being discarded."""
+        if self._timer_source_id is not None:
+            GLib.source_remove(self._timer_source_id)
+            self._timer_source_id = None
 
     # ------------------------------------------------------------------
     # Drag source
@@ -715,7 +809,7 @@ class CamerasPage(Gtk.Box):
             base = bytes(png_bytes) if png_bytes else _make_dark_placeholder()
             img = _apply_motion_off_overlay(base)
             if img:
-                GLib.idle_add(self._set_card_snapshot, device.id, img)
+                GLib.idle_add(self._set_card_snapshot, device.id, img, True)
             return
 
         # Motion detection is on — fetch the current live snapshot.
@@ -734,10 +828,12 @@ class CamerasPage(Gtk.Box):
         else:
             _log.debug("No snapshot available for %s", device.name)
 
-    def _set_card_snapshot(self, device_id: int, png_bytes: bytes) -> bool:
+    def _set_card_snapshot(
+        self, device_id: int, png_bytes: bytes, motion_off: bool = False
+    ) -> bool:
         tile = self._cards.get(device_id)
         if tile is not None:
-            tile.set_snapshot(png_bytes)
+            tile.set_snapshot(png_bytes, motion_detection_off=motion_off)
         return GLib.SOURCE_REMOVE
 
     # ------------------------------------------------------------------
@@ -824,6 +920,8 @@ class CamerasPage(Gtk.Box):
 
     def _clear_grid(self) -> None:
         self._cancel_all_refresh_timers()
+        for tile in self._cards.values():
+            tile.cleanup()
         self._cards.clear()
         while (child := self._flow_box.get_first_child()) is not None:
             self._flow_box.remove(child)
