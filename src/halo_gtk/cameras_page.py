@@ -1,4 +1,4 @@
-"""Cameras page — responsive FlowBox camera grid with size modes and drag-to-reorder."""
+"""Cameras page — deterministic camera grid with size modes and drag-to-reorder."""
 
 from __future__ import annotations
 
@@ -25,16 +25,16 @@ _log = logging.getLogger(__name__)
 _SNAPSHOT_FAMILIES = frozenset({"doorbots", "authorized_doorbots", "stickup_cams"})
 
 # Default tile dimensions (16:9) before any snapshot is loaded.
-# Small placeholder so tiles impose no hard minimum on the window before a
-# real snapshot arrives.
 _DEFAULT_NATIVE_W = 320
 _DEFAULT_NATIVE_H = 180
+_FIXED_TILE_W = 16.0
+_FIXED_TILE_H = 9.0
 
-# Size mode: name → (fraction of native width, min tiles per row)
-_SIZE_MODES: dict[str, tuple[float, int]] = {
-    "small": (0.25, 4),
-    "medium": (0.50, 2),
-    "large": (1.00, 1),
+# Size mode → tiles per row.
+_SIZE_MODES: dict[str, int] = {
+    "small": 4,
+    "medium": 2,
+    "large": 1,
 }
 
 # Module-level drag state — safe for same-process DnD.
@@ -77,8 +77,6 @@ def _apply_motion_off_overlay(png_bytes: bytes) -> bytes:
 
         from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont  # noqa: PLC0415
 
-        # Query the system bold sans-serif font via fontconfig; fall back to
-        # Pillow's built-in bitmap default if fc-match is unavailable.
         font = None
         try:
             result = subprocess.run(
@@ -96,10 +94,8 @@ def _apply_motion_off_overlay(png_bytes: bytes) -> bytes:
             font = ImageFont.load_default()
 
         img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
-        # Three sequential Gaussian blur passes for a frosted-glass effect.
         for _ in range(3):
             img = img.filter(ImageFilter.GaussianBlur(radius=8))
-        # Darken slightly to increase text contrast.
         img = ImageEnhance.Brightness(img).enhance(0.75)
         draw = ImageDraw.Draw(img)
         text = "Motion Detection Off"
@@ -107,7 +103,6 @@ def _apply_motion_off_overlay(png_bytes: bytes) -> bytes:
         bbox = draw.textbbox((0, 0), text, font=font)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
         x, y = (w - tw) // 2, (h - th) // 2
-        # 4-way drop shadow at 4 px offset in black, then white foreground.
         for dx, dy in ((-4, -4), (4, -4), (-4, 4), (4, 4)):
             draw.text((x + dx, y + dy), text, fill=(0, 0, 0), font=font)
         draw.text((x, y), text, fill=(255, 255, 255), font=font)
@@ -137,7 +132,6 @@ _TIMER_CSS_PROVIDER: Gtk.CssProvider | None = None
 
 
 def _get_timer_css_provider() -> Gtk.CssProvider:
-    """Return a shared CssProvider for snapshot age timer labels (lazy init)."""
     global _TIMER_CSS_PROVIDER
     if _TIMER_CSS_PROVIDER is None:
         _TIMER_CSS_PROVIDER = Gtk.CssProvider()
@@ -154,15 +148,7 @@ def _get_timer_css_provider() -> Gtk.CssProvider:
 
 async def _fetch_last_event_frame(client, device) -> bytes | None:
     """Return PNG bytes of the first decoded frame from the device's most
-    recent recorded event.
-
-    Strategy:
-      1. Fetch the most recent history event (limit=1).
-      2. Obtain a signed S3 recording URL via async_recording_url().
-      3. Open the URL with PyAV and decode exactly one frame.
-      4. Convert the frame to PNG via Pillow.
-      5. On any failure at any step, fall back to the cached snapshot endpoint.
-    """
+    recent recorded event, falling back to the cached snapshot endpoint."""
     try:
         import av  # noqa: PLC0415
 
@@ -200,23 +186,102 @@ async def _fetch_last_event_frame(client, device) -> bytes | None:
 
 
 # ---------------------------------------------------------------------------
+# AspectBox — custom Gtk.Widget that enforces a fixed h:w ratio via measure()
+# ---------------------------------------------------------------------------
+
+
+class AspectBox(Gtk.Widget):
+    """A single-child widget that enforces a height-for-width aspect ratio.
+
+    The parent grid queries each child's natural size via measure() before it
+    decides row heights. By returning a fixed h = w * _h_ratio from
+    do_measure(VERTICAL, for_size=allocated_width) we guarantee all tiles in a
+    row share the same height regardless of the image's native resolution.
+
+    The inner Gtk.Picture is managed via set_parent / unparent (GTK4 custom
+    widget pattern) and receives the full allocation in do_size_allocate.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._h_ratio: float = _FIXED_TILE_H / _FIXED_TILE_W
+        self._picture = Gtk.Picture(
+            content_fit=Gtk.ContentFit.CONTAIN,
+            can_shrink=True,
+            hexpand=True,
+            vexpand=True,
+            halign=Gtk.Align.FILL,
+            valign=Gtk.Align.FILL,
+        )
+        self._picture.set_parent(self)
+
+    # ------------------------------------------------------------------
+    # GTK4 vfunc overrides
+    # ------------------------------------------------------------------
+
+    def do_dispose(self) -> None:
+        child = self._picture
+        self._picture = None  # type: ignore[assignment]
+        if child is not None:
+            child.unparent()
+        Gtk.Widget.do_dispose(self)
+
+    def do_get_request_mode(self) -> Gtk.SizeRequestMode:
+        return Gtk.SizeRequestMode.HEIGHT_FOR_WIDTH
+
+    def do_measure(
+        self, orientation: Gtk.Orientation, for_size: int
+    ) -> tuple[int, int, int, int]:
+        """Return (minimum, natural, min_baseline, nat_baseline).
+
+        HORIZONTAL: can shrink to 1 px; the grid controls the width.
+        VERTICAL:   fixed height = for_size * _h_ratio so all row tiles
+                    report the same height to the parent layout.
+        """
+        if orientation == Gtk.Orientation.HORIZONTAL:
+            return (1, 1, -1, -1)
+        # VERTICAL
+        if for_size <= 0:
+            return (1, 1, -1, -1)
+        fixed_h = max(1, int(for_size * self._h_ratio))
+        return (fixed_h, fixed_h, -1, -1)
+
+    def do_size_allocate(self, width: int, height: int, baseline: int) -> None:
+        if self._picture is not None:
+            self._picture.allocate(width, height, baseline, None)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def set_ratio(self, h_ratio: float) -> None:
+        """Update the height:width ratio and trigger a remeasure."""
+        self._h_ratio = max(h_ratio, 0.01)
+        self.queue_resize()
+
+    def set_paintable(self, paintable) -> None:
+        if self._picture is not None:
+            self._picture.set_paintable(paintable)
+
+
+# ---------------------------------------------------------------------------
 # Camera tile widget
 # ---------------------------------------------------------------------------
 
 
-class CameraTile(Gtk.FlowBoxChild):
-    """A single camera tile in the FlowBox grid."""
+class CameraTile(Gtk.Frame):
+    """A single camera tile in the camera grid."""
 
-    def __init__(self, device, on_reorder) -> None:
+    def __init__(self, device, on_reorder, on_activate) -> None:
         super().__init__()
         self.device = device
         self._on_reorder = on_reorder
+        self._on_activate = on_activate
         self._native_w = _DEFAULT_NATIVE_W
         self._native_h = _DEFAULT_NATIVE_H
-        self._current_mode = "medium"
+        self._size_mode = "medium"
         self.set_focusable(True)
-        # Tiles pack from the top-left; no expand in either axis.
-        self.set_hexpand(False)
+        self.set_hexpand(True)
         self.set_vexpand(False)
         self.set_halign(Gtk.Align.FILL)
         self.set_valign(Gtk.Align.START)
@@ -226,9 +291,7 @@ class CameraTile(Gtk.FlowBoxChild):
         self._motion_detection_off: bool = False
         self._timer_source_id: int | None = None
 
-        # Card frame.
-        self._frame = Gtk.Frame(css_classes=["card"])
-        self.set_child(self._frame)
+        self.add_css_class("card")
 
         # Inner box — 5px padding on all sides.
         box = Gtk.Box(
@@ -239,16 +302,13 @@ class CameraTile(Gtk.FlowBoxChild):
             margin_start=5,
             margin_end=5,
         )
-        self._frame.set_child(box)
+        self.set_child(box)
 
-        # Snapshot picture wrapped in an Overlay so the age timer badge can
-        # float in the bottom-left corner without affecting layout.
-        self._picture = Gtk.Picture(
-            content_fit=Gtk.ContentFit.FILL,
-            can_shrink=True,
-            hexpand=True,
-            vexpand=False,
-        )
+        # AspectBox enforces the tile height via GTK4 measure().
+        # The Gtk.Picture lives inside AspectBox, not directly in the tree.
+        self.aspect_box = AspectBox()
+
+        # Timer badge floats over the aspect_box.
         self._timer_label = Gtk.Label(
             css_classes=["caption", "numeric", "snapshot-timer"],
             halign=Gtk.Align.START,
@@ -261,7 +321,8 @@ class CameraTile(Gtk.FlowBoxChild):
             _get_timer_css_provider(), Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
         )
         picture_overlay = Gtk.Overlay()
-        picture_overlay.set_child(self._picture)
+        picture_overlay.set_hexpand(True)
+        picture_overlay.set_child(self.aspect_box)
         picture_overlay.add_overlay(self._timer_label)
         box.append(picture_overlay)
 
@@ -279,9 +340,13 @@ class CameraTile(Gtk.FlowBoxChild):
 
         # Hover state.
         motion = Gtk.EventControllerMotion()
-        motion.connect("enter", lambda *_: self._frame.add_css_class("activatable"))
-        motion.connect("leave", lambda *_: self._frame.remove_css_class("activatable"))
-        self._frame.add_controller(motion)
+        motion.connect("enter", lambda *_: self.add_css_class("activatable"))
+        motion.connect("leave", lambda *_: self.remove_css_class("activatable"))
+        self.add_controller(motion)
+
+        click = Gtk.GestureClick()
+        click.connect("released", self._on_click_released)
+        self.add_controller(click)
 
         # Drag source — set module-level ID so the drop target can read it.
         drag_src = Gtk.DragSource(actions=Gdk.DragAction.MOVE)
@@ -295,44 +360,23 @@ class CameraTile(Gtk.FlowBoxChild):
         self.add_controller(drop_tgt)
 
     # ------------------------------------------------------------------
-    # Sizing
+    # Ratio update — called by CamerasPage when mode or snapshot changes
     # ------------------------------------------------------------------
 
-    def apply_size_mode(self, mode: str) -> None:
-        """Store the new size mode."""
-        self._current_mode = mode
-
-    def do_size_allocate(self, w: int, h: int, b: int) -> None:
-        """Derive picture height from the tile's actual allocated width so the
-        image always fills the tile at its native aspect ratio."""
-        # Inner Box has 5 px margins on each side; Frame "card" adds no pixel-consuming border.
-        content_w = max(1, w - 10)
-        uncapped_h = max(1, int(content_w * self._native_h / self._native_w))
-        # Cap tile height to a 16:9 maximum so portrait/square cameras (e.g.
-        # doorbell at 1:1) don't make a row taller than widescreen cameras.
-        max_h = max(1, int(content_w * 9 / 16))
-        if uncapped_h > max_h:
-            # Taller than 16:9 — cap height and let CONTAIN letterbox within the
-            # capped cell so the image is never distorted.
-            pic_h = max_h
-            self._picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+    def update_ratio(self, mode: str) -> None:
+        """Update the measured display box for the active size mode."""
+        self._size_mode = mode
+        if mode in {"small", "medium"}:
+            self.aspect_box.set_ratio(_FIXED_TILE_H / _FIXED_TILE_W)
         else:
-            # 16:9 or wider — FILL renders pixel-perfect with no letterboxing.
-            pic_h = uncapped_h
-            self._picture.set_content_fit(Gtk.ContentFit.FILL)
-        self._picture.set_size_request(content_w, pic_h)
-        Gtk.FlowBoxChild.do_size_allocate(self, w, h, b)
+            self.aspect_box.set_ratio(self._native_h / self._native_w)
 
     # ------------------------------------------------------------------
     # Snapshot
     # ------------------------------------------------------------------
 
     def set_snapshot(self, png_bytes: bytes, *, motion_detection_off: bool = False) -> None:
-        """Update the thumbnail from raw PNG bytes (GTK main thread).
-
-        Pass ``motion_detection_off=True`` to hide the age timer (the image is
-        a static blurred still, so elapsed time is not meaningful).
-        """
+        """Update the thumbnail from raw PNG bytes (GTK main thread)."""
         try:
             from PIL import Image  # noqa: PLC0415
 
@@ -344,10 +388,7 @@ class CameraTile(Gtk.FlowBoxChild):
             loader.close()
             pixbuf = loader.get_pixbuf()
             if pixbuf is not None:
-                self._picture.set_paintable(Gdk.Texture.new_for_pixbuf(pixbuf))
-                # Trigger a re-layout so do_size_allocate recomputes picture height
-                # with the new native dimensions.
-                self.queue_resize()
+                self.aspect_box.set_paintable(Gdk.Texture.new_for_pixbuf(pixbuf))
         except Exception as exc:
             _log.debug("CameraTile.set_snapshot failed for %s: %s", self.device.name, exc)
 
@@ -357,14 +398,13 @@ class CameraTile(Gtk.FlowBoxChild):
         else:
             self._snapshot_loaded_at = time.monotonic()
             self._timer_label.set_visible(True)
-            self._update_timer()  # Refresh text immediately; don't wait for next tick.
+            self._update_timer()
 
     # ------------------------------------------------------------------
     # Snapshot age timer
     # ------------------------------------------------------------------
 
     def _update_timer(self) -> bool:
-        """Tick callback: update the age badge text every second."""
         if not self._timer_label.get_visible():
             return GLib.SOURCE_CONTINUE
         elapsed = int(time.monotonic() - self._snapshot_loaded_at)
@@ -381,7 +421,6 @@ class CameraTile(Gtk.FlowBoxChild):
         return GLib.SOURCE_CONTINUE
 
     def cleanup(self) -> None:
-        """Cancel the GLib timer when the tile is being discarded."""
         if self._timer_source_id is not None:
             GLib.source_remove(self._timer_source_id)
             self._timer_source_id = None
@@ -412,6 +451,12 @@ class CameraTile(Gtk.FlowBoxChild):
         self._on_reorder(src_id, self.device.id)
         return True
 
+    def _on_click_released(
+        self, gesture: Gtk.GestureClick, n_press: int, x: float, y: float
+    ) -> None:
+        if n_press == 1:
+            self._on_activate(self.device)
+
 
 # ---------------------------------------------------------------------------
 # Live stream panel
@@ -427,7 +472,6 @@ class _LivePanel(Gtk.Box):
         self._on_go_history = on_go_history
         self._device = None
 
-        # --- top bar ---
         top_bar = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL,
             spacing=6,
@@ -450,7 +494,6 @@ class _LivePanel(Gtk.Box):
         )
         top_bar.append(self._title_label)
 
-        # Volume slider.
         vol_box = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL,
             spacing=4,
@@ -465,7 +508,6 @@ class _LivePanel(Gtk.Box):
         vol_box.append(self._vol_scale)
         top_bar.append(vol_box)
 
-        # Screenshot button.
         screenshot_btn = Gtk.Button(
             icon_name="camera-photo-symbolic",
             tooltip_text="Save screenshot",
@@ -473,7 +515,6 @@ class _LivePanel(Gtk.Box):
         screenshot_btn.connect("clicked", self._on_screenshot)
         top_bar.append(screenshot_btn)
 
-        # Event history button.
         history_btn = Gtk.Button(
             icon_name="document-open-recent-symbolic",
             tooltip_text="Event history for this camera",
@@ -481,16 +522,12 @@ class _LivePanel(Gtk.Box):
         history_btn.connect("clicked", self._on_history)
         top_bar.append(history_btn)
 
-        # Separator.
         self.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
 
-        # Embedded live stream view.
         from halo_gtk.live_stream import LiveStreamView
 
         self._live_view = LiveStreamView()
         self.append(self._live_view)
-
-    # ------------------------------------------------------------------
 
     def start_for_device(self, device) -> None:
         self._device = device
@@ -526,7 +563,7 @@ class _LivePanel(Gtk.Box):
 
 
 class CamerasPage(Gtk.Box):
-    """Two-state cameras panel: responsive FlowBox grid ↔ embedded live stream."""
+    """Two-state cameras panel: camera grid ↔ embedded live stream."""
 
     def __init__(self, on_navigate_to_history=None, on_title_change=None) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, hexpand=True, vexpand=True)
@@ -538,7 +575,6 @@ class CamerasPage(Gtk.Box):
         # device_id → GLib source_id for 30-second fallback refresh.
         self._refresh_timers: dict[int, int] = {}
 
-        # Restore persisted preferences.
         cfg = _cfg.load()
         self._size_mode: str = cfg.get("camera_grid_size", "medium")
         if self._size_mode not in _SIZE_MODES:
@@ -567,7 +603,6 @@ class CamerasPage(Gtk.Box):
         )
         self._stack.add_named(grid_box, "grid")
 
-        # In-page toolbar: size mode toggle buttons on the right.
         toolbar = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL,
             margin_top=6,
@@ -576,18 +611,15 @@ class CamerasPage(Gtk.Box):
             margin_end=12,
         )
         grid_box.append(toolbar)
-
-        # Spacer pushes buttons to the right.
         toolbar.append(Gtk.Box(hexpand=True))
 
         size_box = Gtk.Box(css_classes=["linked"], spacing=0)
-
         self._size_btns: dict[str, Gtk.ToggleButton] = {}
         first_btn = None
         for mode, label, tip in [
-            ("small", "S", "Small tiles — 4 per row minimum"),
-            ("medium", "M", "Medium tiles — 2 per row minimum"),
-            ("large", "L", "Large tiles — 1 per row minimum"),
+            ("small", "S", "Small tiles — 4 per row"),
+            ("medium", "M", "Medium tiles — 2 per row"),
+            ("large", "L", "Large tiles — 1 per row, full width"),
         ]:
             btn = Gtk.ToggleButton(label=label, tooltip_text=tip)
             if first_btn is None:
@@ -602,7 +634,6 @@ class CamerasPage(Gtk.Box):
         toolbar.append(size_box)
         grid_box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
 
-        # Status page shown when list is empty or loading.
         self._status_page = Adw.StatusPage(
             icon_name="camera-video-symbolic",
             title="No cameras",
@@ -616,28 +647,25 @@ class CamerasPage(Gtk.Box):
             vexpand=True,
             visible=False,
             hscrollbar_policy=Gtk.PolicyType.NEVER,
+            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
         )
         grid_box.append(scroll)
         self._scroll = scroll
 
-        self._flow_box = Gtk.FlowBox(
+        self._grid = Gtk.Grid(
             column_spacing=5,
             row_spacing=5,
             margin_top=5,
             margin_bottom=5,
             margin_start=5,
             margin_end=5,
-            homogeneous=False,
-            selection_mode=Gtk.SelectionMode.NONE,
-            # Pack rows from the top; don't stretch to fill vertical space.
+            hexpand=True,
             vexpand=False,
+            halign=Gtk.Align.FILL,
             valign=Gtk.Align.START,
         )
-        _, num_per_row = _SIZE_MODES[self._size_mode]
-        self._flow_box.set_min_children_per_line(num_per_row)
-        self._flow_box.set_max_children_per_line(num_per_row)
-        self._flow_box.connect("child-activated", self._on_child_activated)
-        scroll.set_child(self._flow_box)
+        self._apply_size_mode_layout(self._size_mode)
+        scroll.set_child(self._grid)
 
         # --- Live page ---
         self._live_panel = _LivePanel(
@@ -654,14 +682,17 @@ class CamerasPage(Gtk.Box):
         if not button.get_active():
             return
         self._size_mode = mode
-        _, num_per_row = _SIZE_MODES[mode]
-        self._flow_box.set_min_children_per_line(num_per_row)
-        self._flow_box.set_max_children_per_line(num_per_row)
+        self._apply_size_mode_layout(mode)
         for tile in self._cards.values():
-            tile.apply_size_mode(mode)
+            tile.update_ratio(mode)
         cfg = _cfg.load()
         cfg["camera_grid_size"] = mode
         _cfg.save(cfg)
+
+    def _apply_size_mode_layout(self, mode: str) -> None:
+        self._grid.set_column_homogeneous(mode in {"small", "medium"})
+        self._grid.set_row_homogeneous(False)
+        self._rebuild_grid()
 
     # ------------------------------------------------------------------
     # Drag-and-drop reorder
@@ -669,13 +700,7 @@ class CamerasPage(Gtk.Box):
 
     def _on_reorder(self, src_id: int, dst_id: int) -> None:
         """Move the tile for *src_id* to the position of *dst_id*."""
-        # Build current order from FlowBox children.
-        order: list[int] = []
-        child = self._flow_box.get_first_child()
-        while child is not None:
-            if isinstance(child, CameraTile):
-                order.append(child.device.id)
-            child = child.get_next_sibling()
+        order = [did for did in self._order if did in self._cards]
 
         if src_id not in order or dst_id not in order:
             return
@@ -685,18 +710,8 @@ class CamerasPage(Gtk.Box):
         order.pop(src_idx)
         order.insert(dst_idx, src_id)
 
-        # Remove all tiles, then re-add in new order.
-        for did in list(order):
-            tile = self._cards.get(did)
-            if tile is not None:
-                self._flow_box.remove(tile)
-
-        for did in order:
-            tile = self._cards.get(did)
-            if tile is not None:
-                self._flow_box.append(tile)
-
         self._order = order
+        self._rebuild_grid()
         cfg = _cfg.load()
         cfg["camera_order"] = order
         _cfg.save(cfg)
@@ -754,7 +769,6 @@ class CamerasPage(Gtk.Box):
         self._status_page.set_visible(False)
         self._scroll.set_visible(True)
 
-        # Apply saved order: known IDs first (in saved order), new IDs appended.
         known = {did: i for i, did in enumerate(self._order)}
         ordered = sorted(
             devices,
@@ -762,9 +776,12 @@ class CamerasPage(Gtk.Box):
         )
 
         for device in ordered:
-            tile = CameraTile(device, on_reorder=self._on_reorder)
-            tile.apply_size_mode(self._size_mode)
-            self._flow_box.append(tile)
+            tile = CameraTile(
+                device,
+                on_reorder=self._on_reorder,
+                on_activate=self._show_live,
+            )
+            tile.update_ratio(self._size_mode)
             self._cards[device.id] = tile
 
             threading.Thread(
@@ -774,10 +791,12 @@ class CamerasPage(Gtk.Box):
             ).start()
             self._start_refresh_timer(device.id)
 
-        # Register for FCM events.
         client = get_client()
         if client is not None:
             client.add_event_callback(self._on_ring_event)
+
+        self._order = [device.id for device in ordered]
+        self._rebuild_grid()
 
         return GLib.SOURCE_REMOVE
 
@@ -798,8 +817,6 @@ class CamerasPage(Gtk.Box):
             return
 
         if not getattr(device, "motion_detection", True):
-            # Motion detection is off — decode the first frame of the most
-            # recent recording as the base image, then apply the blur overlay.
             png_bytes = client._run(_fetch_last_event_frame(client, device))
             base = bytes(png_bytes) if png_bytes else _make_dark_placeholder()
             img = _apply_motion_off_overlay(base)
@@ -807,7 +824,6 @@ class CamerasPage(Gtk.Box):
                 GLib.idle_add(self._set_card_snapshot, device.id, img, True)
             return
 
-        # Motion detection is on — fetch the current live snapshot.
         png_bytes: bytes | None = None
         try:
             png_bytes = client._run(device.async_get_snapshot())
@@ -829,6 +845,8 @@ class CamerasPage(Gtk.Box):
         tile = self._cards.get(device_id)
         if tile is not None:
             tile.set_snapshot(png_bytes, motion_detection_off=motion_off)
+            # Native dimensions are now known — update the AspectBox ratio.
+            tile.update_ratio(self._size_mode)
         return GLib.SOURCE_REMOVE
 
     # ------------------------------------------------------------------
@@ -854,10 +872,6 @@ class CamerasPage(Gtk.Box):
     # ------------------------------------------------------------------
     # Tile activation → live stream
     # ------------------------------------------------------------------
-
-    def _on_child_activated(self, flow_box: Gtk.FlowBox, child: Gtk.FlowBoxChild) -> None:
-        if isinstance(child, CameraTile):
-            self._show_live(child.device)
 
     def _show_live(self, device) -> None:
         self._live_panel.start_for_device(device)
@@ -918,5 +932,17 @@ class CamerasPage(Gtk.Box):
         for tile in self._cards.values():
             tile.cleanup()
         self._cards.clear()
-        while (child := self._flow_box.get_first_child()) is not None:
-            self._flow_box.remove(child)
+        while (child := self._grid.get_first_child()) is not None:
+            self._grid.remove(child)
+
+    def _rebuild_grid(self) -> None:
+        while (child := self._grid.get_first_child()) is not None:
+            self._grid.remove(child)
+
+        children_per_line = _SIZE_MODES[self._size_mode]
+        ordered_ids = [did for did in self._order if did in self._cards]
+
+        for index, device_id in enumerate(ordered_ids):
+            tile = self._cards[device_id]
+            tile.update_ratio(self._size_mode)
+            self._grid.attach(tile, index % children_per_line, index // children_per_line, 1, 1)
