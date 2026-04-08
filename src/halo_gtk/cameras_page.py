@@ -918,7 +918,8 @@ class CamerasPage(Gtk.Box):
             args=(tile.device,),
             daemon=True,
         ).start()
-        self._refresh_timers.pop(device_id, None)
+        self._refresh_timers.pop(device_id, None)  # clear stale id before re-arming
+        self._start_refresh_timer(device_id)        # arm the next 30-second cycle
         return GLib.SOURCE_REMOVE
 
     # ------------------------------------------------------------------
