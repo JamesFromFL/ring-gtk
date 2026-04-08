@@ -21,10 +21,10 @@ Native GTK4 + libadwaita Linux desktop client for [Ring](https://ring.com) home 
 - [x] Camera grid view — snapshot thumbnails in a flow grid, click to expand to full-width live view with back navigation
 - [x] Event History — two-panel layout, event list with camera filter, GStreamer video playback, scrubber, volume control, favourite, share, download, screenshot, and delete actions
 - [x] Motion Detection Off overlay — blurred snapshot with "Motion Detection Off" label for cameras with motion detection disabled
+- [x] Two-way audio through camera speakers from PC
 
 ### Planned
 
-- [ ] Two-way audio through camera speakers from PC
 - [ ] Desktop notifications — wire FCM events to libnotify
 - [ ] Systray state icons — blue (disarmed), red (armed), yellow (activity), with flashing states for alarm events
 - [ ] Ring Alarm sensor status panel — contact sensors, motion sensors
