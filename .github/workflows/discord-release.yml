@@ -1,0 +1,39 @@
+name: Discord Release Notification
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send release to Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+          NAME: ${{ github.event.release.name }}
+          URL: ${{ github.event.release.html_url }}
+          BODY: ${{ github.event.release.body }}
+        run: |
+          content="🚀 **New MyKey Proxy release published**"
+          json=$(jq -n \
+            --arg content "$content" \
+            --arg repo "$REPO" \
+            --arg tag "$TAG" \
+            --arg name "$NAME" \
+            --arg url "$URL" \
+            --arg body "$BODY" \
+            '{
+              content: $content,
+              embeds: [
+                {
+                  title: ($name // $tag),
+                  url: $url,
+                  description: ("**Repository:** " + $repo + "\n**Version:** " + $tag + "\n\n" + ($body // "No release notes provided.")),
+                  color: 5814783
+                }
+              ]
+            }')
+          curl -H "Content-Type: application/json" -X POST -d "$json" "$DISCORD_WEBHOOK"
