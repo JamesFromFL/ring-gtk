@@ -572,6 +572,8 @@ class CamerasPage(Gtk.Box):
         self._cards: dict[int, CameraTile] = {}
         # device_id → GLib source_id for 30-second fallback refresh.
         self._refresh_timers: dict[int, int] = {}
+        # device_id → last good PNG bytes; survives grid rebuilds for cache-first display.
+        self._snapshot_cache: dict[int, bytes] = {}
 
         cfg = _cfg.load()
         self._size_mode: str = cfg.get("camera_grid_size", "medium")
@@ -782,6 +784,10 @@ class CamerasPage(Gtk.Box):
             tile.update_ratio(self._size_mode)
             self._cards[device.id] = tile
 
+            cached = self._snapshot_cache.get(device.id)
+            if cached is not None:
+                self._set_card_snapshot(device.id, cached)
+
             threading.Thread(
                 target=self._load_snapshot,
                 args=(device,),
@@ -840,6 +846,7 @@ class CamerasPage(Gtk.Box):
     def _set_card_snapshot(
         self, device_id: int, png_bytes: bytes, motion_off: bool = False
     ) -> bool:
+        self._snapshot_cache[device_id] = png_bytes
         tile = self._cards.get(device_id)
         if tile is not None:
             tile.set_snapshot(png_bytes, motion_detection_off=motion_off)
@@ -919,7 +926,7 @@ class CamerasPage(Gtk.Box):
             daemon=True,
         ).start()
         self._refresh_timers.pop(device_id, None)  # clear stale id before re-arming
-        self._start_refresh_timer(device_id)        # arm the next 30-second cycle
+        self._start_refresh_timer(device_id)  # arm the next 30-second cycle
         return GLib.SOURCE_REMOVE
 
     # ------------------------------------------------------------------
