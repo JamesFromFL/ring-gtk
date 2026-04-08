@@ -1,0 +1,43 @@
+name: Discord Dev Log
+
+on:
+  push:
+  pull_request:
+    types: [opened, closed, reopened]
+  issues:
+    types: [opened, closed, reopened]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send dev log message to Discord
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_DEVLOG_WEBHOOK }}
+          EVENT_NAME: ${{ github.event_name }}
+          ACTOR: ${{ github.actor }}
+          REPO: ${{ github.repository }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+        run: |
+          if [ "$EVENT_NAME" = "push" ]; then
+            CONTENT="🔧 **Push** to \`$REPO\` by **$ACTOR** on \`$REF_NAME\`\n**Commit:** $COMMIT_MSG\n$REPO_URL"
+          elif [ "$EVENT_NAME" = "pull_request" ]; then
+            CONTENT="🔀 **Pull Request** in \`$REPO\` by **$ACTOR**\n**Title:** $PR_TITLE\n$PR_URL"
+          elif [ "$EVENT_NAME" = "issues" ]; then
+            CONTENT="🐛 **Issue Update** in \`$REPO\` by **$ACTOR**\n**Title:** $ISSUE_TITLE\n$ISSUE_URL"
+          else
+            CONTENT="📌 **Repository activity** in \`$REPO\` by **$ACTOR**\n$REPO_URL"
+          fi
+
+          jq -n --arg content "$CONTENT" '{content: $content}' > payload.json
+
+          curl -H "Content-Type: application/json" \
+               -X POST \
+               -d @payload.json \
+               "$WEBHOOK"
