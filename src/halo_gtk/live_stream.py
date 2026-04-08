@@ -204,7 +204,8 @@ class LiveStreamView(Gtk.Box):
         self._paintable = self._pipeline.get_by_name("vsink").get_property("paintable")
 
         # Pre-declare pixel format only; width/height set on first real frame.
-        self._video_appsrc.set_property("caps", Gst.Caps.from_string("video/x-raw,format=RGB,framerate=0/1"))
+        caps_str = "video/x-raw,format=RGB,framerate=0/1"
+        self._video_appsrc.set_property("caps", Gst.Caps.from_string(caps_str))
         self._pipeline.set_state(Gst.State.PLAYING)
 
     # ------------------------------------------------------------------
