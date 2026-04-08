@@ -229,9 +229,7 @@ class AspectBox(Gtk.Widget):
     def do_get_request_mode(self) -> Gtk.SizeRequestMode:
         return Gtk.SizeRequestMode.HEIGHT_FOR_WIDTH
 
-    def do_measure(
-        self, orientation: Gtk.Orientation, for_size: int
-    ) -> tuple[int, int, int, int]:
+    def do_measure(self, orientation: Gtk.Orientation, for_size: int) -> tuple[int, int, int, int]:
         """Return (minimum, natural, min_baseline, nat_baseline).
 
         HORIZONTAL: can shrink to 1 px; the grid controls the width.
